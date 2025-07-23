@@ -615,7 +615,7 @@ class anis_pta():
         # the power in each pixel assuming no power in others, i.e. radiometer!
 
         # Get the full fisher matrix
-        fisher_mat = self.fisher_matrix_pixel()
+        fisher_mat = self.fisher_matrix_pixel(pair_cov)
         # Get only the diagonal elements and invert
         fisher_diag_inv = np.diag( 1/np.diag(fisher_mat) )
     
