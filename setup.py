@@ -11,7 +11,7 @@ setup(
     # Needed for dependencies
     install_requires=['numpy', 'scipy', 'sympy', 'astroML', 'PTMCMCSampler', 'healpy', 'lmfit'],
     # *strongly* suggested for sharing
-    version='0.4.2',
+    version='0.4.3',
     # The license can be anything you like
     license='MIT',
     description='Package to generate sky maps for PTA stochastic gravitational wave backgrounds.',
