@@ -1,0 +1,165 @@
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+from jax.scipy.integrate import trapezoid as jtrapezoid
+import jaxopt # Can also move to optimistix if ever preferred - jaxopt seems faster and more intuitive
+
+# This file has the anis_pta class at the top and then the JAX functions at the bottom
+
+# JAX functions - anisotropy bases at the top and utils at the bottom
+
+# Anisotropy bases
+
+@jax.jit
+def _radiometer_basis(rho, pix_area, fisher_matrix_pixel, N_inv, F_mat):
+        dirty_map = F_mat.T @ N_inv @ rho
+        fisher_diag_inv = jnp.diag( 1/fisher_matrix_pixel )
+        radio_map = fisher_diag_inv @ dirty_map
+        norm = 4 * jnp.pi / jtrapezoid(radio_map, dx = pix_area)
+        radio_map_n = radio_map * norm
+        radio_map_err = jnp.sqrt(jnp.diag(fisher_diag_inv)) * norm
+        return radio_map_n, radio_map_err
+
+@jax.jit
+def _pixel_basis(rho, npix, F_mat, Lt, params, area):
+    #params = jnp.ones(npix)
+    #area = 4*jnp.pi/npix
+    def residuals(params):
+        power_map = jnp.sqrt(params**2 + 1) - 1 #Apply non-negativity constraint using LMFit's convention, which uses the MINUIT convention
+        model_orf = F_mat @ power_map
+        r = rho - model_orf
+        return Lt @ r
+    opt_params, state = jax.jit(jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run)(params)
+    opt_power_map = jnp.sqrt(opt_params**2 + 1) - 1
+    return opt_power_map, state
+
+@jax.jit
+def _sph_basis(rho, nclm, Gamma_lm, Lt, params, c00):
+    #params = jnp.zeros(nclm) # using caching instead
+    #c00 = jnp.array([jnp.sqrt(4*jnp.pi)]) # using caching instead
+    def residuals(params):
+        A2 = 10**(params[0])
+        clm = jnp.concatenate((c00,params[1:]))
+        orf = clm @ Gamma_lm
+        model_orf = A2*orf
+        r = rho - model_orf
+        return Lt @ r
+    opt_params, state = jax.jit(jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run)(params)
+    opt_A2 = 10**(opt_params[0])
+    opt_clm = jnp.concatenate((c00,opt_params[1:]))
+    return opt_A2, opt_clm, state
+
+# almost unreadable from how much caching I'm using
+@jax.jit
+def _sqrt_basis(rho, nblm, Gamma_lm, Lt,
+                cache_bmvals_zero, cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative, cache_beta_vals,
+                cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2,
+                params, b00):
+    #params = jnp.zeros(2*nblm-1) # using caching instead
+    #b00 = jnp.array([1]) # using caching instead
+    def residuals(params):
+        A2 = 10**(2*jnp.sin(params[0]))
+        blm = jnp.concatenate((b00, params[1::2]+1j*params[2::2]))
+        real_blm = jnp.real(blm)
+        blm = jnp.where(cache_bmvals_zero, real_blm, blm)
+        alm = blm2alm(blm, cache_beta_vals,
+                      cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative)
+        clm = alm2clm(alm,
+                      cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2)
+        orf = clm @ Gamma_lm
+        model_orf = A2*orf
+        r = rho - model_orf
+        return Lt @ r
+    opt_params, state = jax.jit(jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run)(params)
+    opt_A2 = 10**(2*jnp.sin(opt_params[0]))
+    opt_blm = jnp.concatenate((b00, opt_params[1::2]+1j*opt_params[2::2]))
+    real_opt_blm = jnp.real(opt_blm)
+    opt_blm = jnp.where(cache_bmvals_zero, real_opt_blm, opt_blm)
+    opt_alm = blm_2_alm(opt_blm, cache_beta_vals,
+                        cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative)
+    opt_clm = alm_2_clm(opt_alm,
+                        cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2)
+    return opt_A2, opt_clm, state
+
+@jax.jit
+def _iso_fit(rho, Lt, HD_curve, A2):
+    #A2 = jnp.ones(1) # using caching instead
+    def residuals(A2):
+        model_orf = (jnp.sqrt(jnp.power(A2, 2) + 1) - 1) * HD_curve # following LMFit for lower-bounded parameters; LMFit in turn follows MINUIT convention
+        r = rho - model_orf
+        return Lt @ r
+    opt_A2, state = jax.jit(jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run)(A2)
+    return (jnp.sqrt(jnp.power(opt_A2, 2) + 1) - 1)*HD_curve, state
+
+@jax.jit
+def _orf_to_snr(ani_orf, iso_orf, rho, N_inv, N_inv_nopc):
+    ani_res = rho - ani_orf
+    iso_res = rho - iso_orf
+    snm = (-1/2)*((ani_res).T @ N_inv @ (ani_res)) # Anisotropy chi-square
+    hdnm = (-1/2)*((iso_res).T @ N_inv @ (iso_res)) # Isotropy chi-square
+    nm = (-1/2)*((rho).T @ N_inv_nopc @ (rho)) # Null chi-square (Not pair covariant)
+    total_sn = 2 * (snm - nm)
+    iso_sn = 2 * (hdnm - nm)
+    anis_sn = 2 * (snm - hdnm)
+    return total_sn, iso_sn, anis_sn
+in_axes_orfs = (0,None,None,None,None)
+orf_to_snr = jax.vmap(_orf_to_snr, in_axes=in_axes_orfs)
+
+@jax.jit
+def _get_snrs(radiometer_map, pixel_map, A2_sph, clm_sph, A2_sqrt, clm_sqrt,
+              rho, N_inv, N_inv_nopc, iso_orf, Gamma_lm, F_mat):
+    radiometer_orf = F_mat @ radiometer_map
+    pixel_orf = F_mat @ pixel_map
+    sph_orf = A2_sph * (clm_sph @ Gamma_lm)
+    sqrt_orf = A2_sqrt * (clm_sqrt @ Gamma_lm)
+    orfs = jnp.vstack((radiometer_orf, pixel_orf, sph_orf, sqrt_orf))
+    snrs = orf_to_snr(orfs, iso_orf, rho, N_inv, N_inv_nopc)
+    return snrs
+
+# utils functions
+@jax.jit
+def alm2clm(alm,
+            cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2):
+    clm = alm[cache_clm_mask]
+    cache_positive_m = cache_m_vals_float_power * jnp.real(clm) * SQRT2
+    cache_negative_m = cache_m_vals_float_power * jnp.imag(clm) * SQRT2
+    clm = jnp.where(cache_m_vals_positive, cache_positive_m, clm)
+    clm = jnp.where(cache_m_vals_negative, cache_negative_m, clm)
+    clm = jnp.real(clm)
+    return clm
+
+@jax.jit
+def blm2alm(blms_in, beta_vals,
+            cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative):
+    blm_full = blms_in[cache_blm_mask]
+    cache_blm_full = cache_blm_vals_float_power*jnp.conj(blm_full)
+    blm_full = jnp.where(cache_bmvals_negative, cache_blm_full, blm_full)
+    alm_vals = jnp.einsum('ijk,j,k', beta_vals, blm_full, blm_full)
+    return alm_vals
+
+@jax.jit
+def _get_N_inv_nopc(sig):
+    return jnp.diag(1/sig ** 2)
+
+@jax.jit
+def _get_N_inv(sig, C):
+    A = jnp.diag(sig ** 2)
+    K = C - A
+    In = jnp.eye(A.shape[0])
+    return woodbury_inverse(A, In, In, K)
+
+@jax.jit
+def woodbury_inverse(A, U, C, V):
+    Ainv = jnp.diag( 1/jnp.diag(A) )
+    Cinv = jnp.linalg.pinv(C)
+    CVAU = Cinv + V @ Ainv @ U
+    tot_inv = Ainv - Ainv @ U @ jnp.linalg.solve(CVAU, V @ Ainv)
+    return tot_inv
+
+@jax.jit
+def _get_Lt(N_inv):
+    return jnp.linalg.cholesky(N_inv).T
+
+@jax.jit
+def _get_fisher_radiometer(F_mat, N_inv):
+    return jnp.diag( F_mat.T @ N_inv @ F_mat )
