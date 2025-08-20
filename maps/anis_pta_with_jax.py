@@ -147,7 +147,7 @@ class anis_pta():
                 self.Gamma_lm[:, i] = Gamma_lm_mat[:, a, b]
         self.Gamma_lm = jnp.array(self.Gamma_lm)
 
-        _make_cache()
+        self._make_cache()
                      
         return None
     
@@ -296,85 +296,111 @@ class anis_pta():
 
         return fisher_mat
 
-        def anisotropy_recovery(self, basis, pair_cov):
-            if pair_cov: 
+    def anisotropy_recovery(self, basis, pair_cov):
+        if pair_cov: 
+            if self._N_inv_pc is None: # No reason to recompute these if done already
+                self._N_inv_pc = _get_N_inv(self.sig, self.pair_cov)
+            N_inv = self._N_inv_pc
             # Use the Cholesky decomposition to get L
-                if self._N_inv_pc is None: # No reason to recompute these if done already
-                    self._N_inv_pc = _get_N_inv(self.sig, self.pair_cov)
-                N_inv = self._N_inv_pc
-            else: 
-                # Without pair covariance, L = L.T = diag(1/sig)
-                if self._N_inv_nopc is None: # No reason to recompute these if done already
-                    self._N_inv_nopc = _get_N_inv_nopc(self.sig)
-                N_inv = self._N_inv_nopc
+            if self._Lt_pc is None: # No reason to recompute these if done already
+                self._Lt_pc = _get_Lt(N_inv)
+            Lt = self._Lt_pc
+        else: 
+            if self._N_inv_nopc is None: # No reason to recompute these if done already
+                self._N_inv_nopc = _get_N_inv_nopc(self.sig)
+            N_inv = self._N_inv_nopc
+            # Without pair covariance, L = L.T = diag(1/sig)
+            if self._Lt_nopc is None: # No reason to recompute these if done already
+                self._Lt_nopc = _get_Lt_nopc(self.sig)
+            Lt = self._Lt_nopc
             
-            if pair_cov: 
+        if basis == 'sqrt':
+            recovery = _sqrt_basis(self.rho, self.Gamma_lm, Lt,
+                                   self._bmvals_zero, self._blm_mask, self._blm_vals_float_power, self._bmvals_negative, self._beta_vals,
+                                   self._clm_mask, self._mvals_float_power, self._mvals_positive, self._mvals_negative, self._SQRT2,
+                                   jnp.array(np.random.rand(2*self.blm_size-1)), self._b00) # "prior" on blm components is [0,1] (temporarily)
+        elif basis == 'pixel':
+            recovery = _pixel_basis(self.rho, self.F_mat, Lt, 2*jnp.array(np.random.rand(self.npix))) # "prior" on pixel amplitudes is [0,2] (maybe temporarily)
+        elif basis == 'radiometer':
+            recovery = _radiometer_basis(self.rho, self.pix_area, N_inv, self.F_mat)
+        elif basis == 'spherical':
+            recovery = _sph_basis(self.rho, self.Gamma_lm, Lt, jnp.array(np.random.rand(self.clm_size-1)), self._c00) # "prior" on clms is [0,1] (temporarily)
+        elif basis == 'eigenmaps':
+            raise NotImplementedError('Basis not implemented yet!')
+        else:
+            raise ValueError('Basis not recognized!')
+        return recovery
+
+    def get_snrs_squared(self, basis_decomposition, basis, pair_cov):
+        # basis_decomposition is a pixel map if basis is 'radiometer' or 'pixel'
+        # basis_decomposition is a tuple, array, or list with the first element A2 and the rest the clms
+        # basis is 'radiometer', 'pixel', 'spherical', or 'sqrt'
+        # pair_cov is True or False
+        # returns the square of the total snr, iso snr, and anis snr
+        
+        # Need nopc version for null hypothesis
+        if self._N_inv_nopc is None: # No reason to recompute these if done already
+            self._N_inv_nopc = _get_N_inv_nopc(self.sig)
+        
+        if pair_cov: 
+            if self._N_inv_pc is None: # No reason to recompute these if done already
+                self._N_inv_pc = _get_N_inv(self.sig, self.pair_cov)
+            N_inv = self._N_inv_pc
             # Use the Cholesky decomposition to get L
-                if self._Lt_pc is None: # No reason to recompute these if done already
-                    self._Lt_pc = _get_Lt(self._N_inv_pc)
-                Lt = self._Lt_pc
-            else: 
-                # Without pair covariance, L = L.T = diag(1/sig)
-                if self._Lt_nopc is None: # No reason to recompute these if done already
-                    self._Lt_nopc = _get_Lt(self._N_inv_nopc)
-                Lt = self._Lt_nopc
-            
-            if basis == 'sqrt':
-                recovery = _sqrt_basis(self.rho, self.Gamma_lm, Lt,
-                                       self._bmvals_zero, self._blm_mask, self._blm_vals_float_power, self._bmvals_negative, self._beta_vals,
-                                       self._clm_mask, self._mvals_float_power, self._mvals_positive, self._mvals_negative, self._SQRT2,
-                                       jnp.array(np.random.rand(self.blm_size-1)), self._b00) # "prior" is [0,1] (temporarily)
-            elif basis == 'pixel':
-                recovery = _pixel_basis(self.rho, self.F_mat, Lt, 2*jnp.array(np.random.rand(self.npix))) # "prior" is [0,2] (maybe temporarily)
-            elif basis == 'radiometer':
-                recovery = _radiometer_basis(self.rho, self.pix_area, _get_fisher_radiometer(self.F_mat, N_inv), N_inv, self.F_mat)
-            elif basis == 'spherical':
-                recovery = _sph_basis(self.rho, self.Gamma_lm, Lt, jnp.array(np.random.rand(self.clm_size-1)), self._c00) # "prior" is [0,1] (temporarily)
-            elif basis == 'eigenmaps':
-                raise NotImplementedError('Basis not implemented yet!')
-            else:
-                raise ValueError('Basis not recognized!')
-            return recovery
+            if self._Lt_pc is None: # No reason to recompute these if done already
+                self._Lt_pc = _get_Lt(N_inv)
+            Lt = self._Lt_pc
+        else:
+            N_inv = self._N_inv_nopc
+            # Without pair covariance, L = L.T = diag(1/sig)
+            if self._Lt_nopc is None: # No reason to recompute these if done already
+                self._Lt_nopc = _get_Lt_nopc(self.sig)
+            Lt = self._Lt_nopc
+        
+        if basis in ['pixel', 'radiometer']:
+            model_orf = _map2orf(basis_decomposition, self.F_mat)
+        elif basis in ['sqrt', 'spherical']:
+            model_orf = basis_decomposition[0]*_clm2orf(basis_decomposition[1:], self.Gamma_lm)
+        iso_orf = _iso_fit(self.rho, Lt, self._HD, 2*jnp.array(np.random.rand(1))) # "prior" on A2 is [0,2] (temporarily)
+        return _orf2snr(model_orf, iso_orf, self.rho, N_inv, self._N_inv_nopc)
 
-        def get_snrs_squared(self, basis_decomposition, basis, pair_cov):
-                return _get_snrs()
-
-        def _make_cache(self):
-            self._SQRT2 = jnp.sqrt(2)
-            self._HD = jnp.array(self.get_pure_HD())
-            self._c00 = jnp.array([jnp.sqrt(4*jnp.pi)])
-            self._b00 = jnp.array([1])
-            self.pix_area = hp.nside2npix(self.nside)
-            # Sqrt basis cache
-            self._beta_vals = jnp.array(self.sqrt_basis_helper.beta_vals)
-            self._blvals = jnp.array(self.sqrt_basis_helper.bl_idx)
-            self._bmvals = jnp.array(self.sqrt_basis_helper.bm_idx)
-            self._abs_bmvals = jnp.abs(self._bmvals)
-            self._lvals = jnp.concatenate([jnp.repeat(jnp.arange(0, self.l_max+1), jnp.array([2*ll + 1 for ll in range(0, self.l_max+1)]))])
-            self._mvals = jnp.concatenate([jnp.arange(-ll, ll+1) for ll in range(0, self.l_max+1)])
-            self._abs_mvals = jnp.abs(self._mvals)
-            self._clm_mask = self._abs_mvals * (2 * self.l_max + 1 - self._abs_mvals) // 2 + self._lvals
-            self._m_vals_positive = self._mvals > 0
-            self._m_vals_negative = self._mvals < 0
-            self._m_vals_float_power = jnp.float_power(-1, self._mvals)
-            self._blm_mask = self._abs_bmvals * (2*self.blmax+1 - self._abs_bmvals) // 2 + self._blvals
-            self._blm_vals_float_power = jnp.float_power(-1, self._bmvals)
-            self._bmvals_negative = self._bmvals < 0
-            self._bmvals_zero = self._bmvals == 0
+    def _make_cache(self):
+        self._SQRT2 = jnp.sqrt(2)
+        self._HD = jnp.array(self.get_pure_HD())
+        self._c00 = jnp.array([jnp.sqrt(4*jnp.pi)])
+        self._b00 = jnp.array([1])
+        self.pix_area = hp.nside2npix(self.nside)
+        # Sqrt basis cache
+        self._beta_vals = jnp.array(self.sqrt_basis_helper.beta_vals)
+        self._blvals = jnp.array(self.sqrt_basis_helper.bl_idx)
+        self._bmvals = jnp.array(self.sqrt_basis_helper.bm_idx)
+        self._abs_bmvals = jnp.abs(self._bmvals)
+        self._lvals = jnp.concatenate([jnp.repeat(jnp.arange(0, self.l_max+1), jnp.array([2*ll + 1 for ll in range(0, self.l_max+1)]))])
+        self._mvals = jnp.concatenate([jnp.arange(-ll, ll+1) for ll in range(0, self.l_max+1)])
+        self._abs_mvals = jnp.abs(self._mvals)
+        self._clm_mask = self._abs_mvals * (2 * self.l_max + 1 - self._abs_mvals) // 2 + self._lvals
+        self._m_vals_positive = self._mvals > 0
+        self._m_vals_negative = self._mvals < 0
+        self._m_vals_float_power = jnp.float_power(-1, self._mvals)
+        self._blm_mask = self._abs_bmvals * (2*self.blmax+1 - self._abs_bmvals) // 2 + self._blvals
+        self._blm_vals_float_power = jnp.float_power(-1, self._bmvals)
+        self._bmvals_negative = self._bmvals < 0
+        self._bmvals_zero = self._bmvals == 0
 
 # JAX functions - anisotropy bases at the top and utils at the bottom
 
 # Anisotropy bases
 
 @jax.jit
-def _radiometer_basis(rho, pix_area, fisher_matrix_radiometer, N_inv, F_mat):
-        dirty_map = F_mat.T @ N_inv @ rho
-        fisher_diag_inv = jnp.diag( 1/fisher_matrix_radiometer )
-        radio_map = fisher_diag_inv @ dirty_map
-        norm = 4 * jnp.pi / trapezoid(radio_map, dx = pix_area)
-        radio_map_n = radio_map * norm
-        radio_map_err = jnp.sqrt(jnp.diag(fisher_diag_inv)) * norm
-        return radio_map_n, radio_map_err
+def _radiometer_basis(rho, pix_area, N_inv, F_mat):
+    fisher_matrix_radiometer = jnp.diag( F_mat.T @ N_inv @ F_mat )
+    dirty_map = F_mat.T @ N_inv @ rho
+    fisher_diag_inv = jnp.diag( 1/fisher_matrix_radiometer )
+    radio_map = fisher_diag_inv @ dirty_map
+    norm = 4 * jnp.pi / trapezoid(radio_map, dx = pix_area)
+    radio_map_n = radio_map * norm
+    radio_map_err = jnp.sqrt(jnp.diag(fisher_diag_inv)) * norm
+    return radio_map_n, radio_map_err
 
 @jax.jit
 def _pixel_basis(rho, F_mat, Lt, params):
@@ -434,7 +460,7 @@ def _sqrt_basis(rho, Gamma_lm, Lt,
 @jax.jit
 def _iso_fit(rho, Lt, HD_curve, A2):
     def residuals(A2):
-        model_orf = (jnp.sqrt(A2**2 - 1) * HD_curve # following LMFit for lower-bounded parameters; LMFit in turn follows MINUIT convention
+        model_orf = (jnp.sqrt(A2**2 + 1) - 1) * HD_curve # following LMFit for lower-bounded parameters; LMFit in turn follows MINUIT convention
         r = rho - model_orf
         return Lt @ r
     opt_A2, state = jax.jit(jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run)(A2)
@@ -449,7 +475,7 @@ def _clm2orf(clm, Gamma_lm):
         return clm @ Gamma_lm
 
 @jax.jit
-def _orf_to_snr(ani_orf, iso_orf, rho, N_inv, N_inv_nopc):
+def _orf2snr(ani_orf, iso_orf, rho, N_inv, N_inv_nopc):
     ani_res = rho - ani_orf
     iso_res = rho - iso_orf
     snm = (-1/2)*((ani_res).T @ N_inv @ (ani_res)) # Anisotropy chi-square
@@ -459,17 +485,6 @@ def _orf_to_snr(ani_orf, iso_orf, rho, N_inv, N_inv_nopc):
     iso_sn = 2 * (hdnm - nm)
     anis_sn = 2 * (snm - hdnm)
     return total_sn, iso_sn, anis_sn
-
-@jax.jit
-def _get_snrs(radiometer_map, pixel_map, A2_sph, clm_sph, A2_sqrt, clm_sqrt,
-              rho, N_inv, N_inv_nopc, iso_orf, Gamma_lm, F_mat):
-    radiometer_orf = F_mat @ radiometer_map
-    pixel_orf = F_mat @ pixel_map
-    sph_orf = A2_sph * (clm_sph @ Gamma_lm)
-    sqrt_orf = A2_sqrt * (clm_sqrt @ Gamma_lm)
-    orfs = jnp.vstack((radiometer_orf, pixel_orf, sph_orf, sqrt_orf))
-    snrs = orf_to_snr(orfs, iso_orf, rho, N_inv, N_inv_nopc)
-    return snrs
 
 # utils functions
 @jax.jit
@@ -514,6 +529,10 @@ def woodbury_inverse(A, U, C, V):
 @jax.jit
 def _get_Lt(N_inv):
     return jnp.linalg.cholesky(N_inv).T
+
+@jax.jit
+def _get_Lt_nopc(sig):
+    return jnp.diag(1/sig)
 
 @jax.jit
 def _get_fisher_radiometer(F_mat, N_inv):
