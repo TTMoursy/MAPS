@@ -29,7 +29,7 @@ class anis_pta():
         xi (np.ndarray, optional): A list of pulsar pair separations from the OS [npair].
         rho (np.ndarray, optional): A list of pulsar pair correlations [npair].
             NOTE: rho is normalized by the OS value, making this slightly different from 
-            what the OS uses. (i.e. OS calculates \hat{A}^2 * ORF while this uses ORF).
+            what the OS uses. (i.e. OS calculates hat{A}^2 * ORF while this uses ORF).
         sig (np.ndarray, optional): A list of 1-sigma uncertainties on rho [npair].
         os (float, optional): The optimal statistic's best-fit A^2 value.
         pair_cov (np.ndarray, optional): The pair covariance matrix [npair x npair].
@@ -169,6 +169,7 @@ class anis_pta():
         # (i.e. get <rho/OS> = <ORF>)
         self._Lt_pc, self._Lt_nopc = None, None # Reset the cholesky decompositions
         self._N_inv, self._N_inv_nopc = None, None
+        self._snr_norm = None
 
         if (rho is not None) and (sig is not None) and (os is not None):
             self.os = jnp.array(os)
@@ -353,7 +354,9 @@ class anis_pta():
         iso_orf, state = _iso_fit(self.rho, Lt, self._HD, 2*jnp.array(np.random.rand(1))) # "prior" on A2 is [0,2] (temporarily)
         
         if pair_cov:
-            return _orf2snr(model_orf, iso_orf, self.rho, N_inv, self._N_inv_nopc, self.sig, self.pair_cov)
+            if self._snr_norm is None:
+                self._snr_norm = _get_snr_norm(self.sig, self.pair_cov)
+            return _orf2snr(model_orf, iso_orf, self.rho, N_inv, self._N_inv_nopc, self._snr_norm)
         else:
             return _orf2snr_nopc(model_orf, iso_orf, self.rho, self._N_inv_nopc)
 
@@ -480,17 +483,20 @@ def _orf2snr_nopc(ani_orf, iso_orf, rho, N_inv_nopc):
     return total_sn, iso_sn, anis_sn
 
 @jax.jit
-def _orf2snr(ani_orf, iso_orf, rho, N_inv, N_inv_nopc, sig, pair_cov_matrix):
+def _get_snr_norm(sig, pair_cov_matrix):
     det_sig = jnp.linalg.slogdet(jnp.diag(sig))[1]
     det_paircov = jnp.linalg.slogdet(pair_cov_matrix)[1]
-    norm = det_sig - det_paircov
+    return 0.5*(det_sig - det_paircov)
+
+@jax.jit
+def _orf2snr(ani_orf, iso_orf, rho, N_inv, N_inv_nopc, snr_norm):
     ani_res = rho - ani_orf
     iso_res = rho - iso_orf
     snm = (-1/2)*((ani_res).T @ N_inv @ (ani_res)) # Anisotropy chi-square
     hdnm = (-1/2)*((iso_res).T @ N_inv @ (iso_res)) # Isotropy chi-square
     nm = (-1/2)*((rho).T @ N_inv_nopc @ (rho)) # Null chi-square (Not pair covariant)
-    total_sn = 2 * (snm - nm + norm)
-    iso_sn = 2 * (hdnm - nm + norm)
+    total_sn = 2 * (snm - nm + snr_norm)
+    iso_sn = 2 * (hdnm - nm + snr_norm)
     anis_sn = 2 * (snm - hdnm)
     return total_sn, iso_sn, anis_sn
 
