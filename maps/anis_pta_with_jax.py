@@ -135,13 +135,10 @@ class anis_pta():
 
         # The spherical harmonic basis for \Gamma_lm_mat shape (nclm, npsrs, npsrs)
         Gamma_lm_mat = ac.anis_basis(np.dstack((self.psrs_phi, self.psrs_theta))[0], 
-                                 lmax = self.l_max, nside = self.nside)
+                                 lmax = self.l_max, nside = self.nside) # This takes a few seconds and could maybe be vectorized
         
         # We need to reorder Gamma_lm_mat to shape (nclm, npairs)
-        self.Gamma_lm = np.zeros((Gamma_lm_mat.shape[0], self.npairs))
-        for i, (a, b) in enumerate(self.pair_idx):
-                self.Gamma_lm[:, i] = Gamma_lm_mat[:, a, b]
-        self.Gamma_lm = jnp.array(self.Gamma_lm)
+        self.Gamma_lm = jnp.array(Gamma_lm_mat[:, self.pair_idx[:,0], self.pair_idx[:,1]])
 
         self._make_cache()
                      
@@ -170,14 +167,12 @@ class anis_pta():
         # Read in OS and normalize cross-correlations by OS. 
         # (i.e. get <rho/OS> = <ORF>)
         self._Lt_pc, self._Lt_nopc = None, None # Reset the cholesky decompositions
+        self._N_inv, self._N_inv_nopc = None, None
 
         if (rho is not None) and (sig is not None) and (os is not None):
             self.os = jnp.array(os)
             self.rho = jnp.array(rho) / self.os
             self.sig = jnp.array(sig) / self.os
-
-            # Set the inverse of the pair independent covariance matrix
-            self.pair_ind_N_inv = self._get_N_inv(pair_cov = False)
 
         else:
             self.rho = None
@@ -244,10 +239,7 @@ class anis_pta():
         FpFc = ac.signalResponse_fast(self.psrs_theta, self.psrs_phi, gwtheta, gwphi)
         Fp,Fc = FpFc[:,0::2], FpFc[:,1::2] 
 
-        R_abk = np.zeros( (self.npairs,self.npix) )
-        # Now lets do some multiplication
-        for i,(a,b) in enumerate(self.pair_idx):
-            R_abk[i] = Fp[a]*Fp[b] + Fc[a]*Fc[b]
+        R_abk = Fp[self.pair_idx[:,0]]*Fp[self.pair_idx[:,1]] + Fc[self.pair_idx[:,0]]*Fc[self.pair_idx[:,1]]
 
         return R_abk
     
@@ -314,13 +306,13 @@ class anis_pta():
             recovery = _sqrt_basis(self.rho, self.Gamma_lm, Lt,
                                    self._bmvals_zero, self._blm_mask, self._blm_vals_float_power, self._bmvals_negative, self._beta_vals,
                                    self._clm_mask, self._mvals_float_power, self._mvals_positive, self._mvals_negative, self._SQRT2,
-                                   jnp.array(np.random.rand(2*self.blm_size-1)), self._b00) # "prior" on blm components is [0,1] (temporarily)
+                                   jnp.array(np.random.rand(2*(self.blmax+1)**2 - 1)), self._b00) # "prior" on blm components is [0,1] (temporarily)
         elif basis == 'pixel':
             recovery = _pixel_basis(self.rho, self.F_mat, Lt, 2*jnp.array(np.random.rand(self.npix))) # "prior" on pixel amplitudes is [0,2] (maybe temporarily)
         elif basis == 'radiometer':
             recovery = _radiometer_basis(self.rho, self.pix_area, N_inv, self.F_mat)
         elif basis == 'spherical':
-            recovery = _sph_basis(self.rho, self.Gamma_lm, Lt, jnp.array(np.random.rand(self.clm_size-1)), self._c00) # "prior" on clms is [0,1] (temporarily)
+            recovery = _sph_basis(self.rho, self.Gamma_lm, Lt, jnp.array(np.random.rand(self.clm_size)), self._c00) # "prior" on clms is [0,1] (temporarily)
         elif basis == 'eigenmaps':
             raise NotImplementedError('Basis not implemented yet!')
         else:
@@ -333,6 +325,11 @@ class anis_pta():
         # basis is 'radiometer', 'pixel', 'spherical', or 'sqrt'
         # pair_cov is True or False
         # returns the square of the total snr, iso snr, and anis snr
+        
+        if basis in ['pixel', 'radiometer']:
+            model_orf = _map2orf(basis_decomposition, self.F_mat)
+        elif basis in ['sqrt', 'spherical']:
+            model_orf = basis_decomposition[0]*_clm2orf(basis_decomposition[1:], self.Gamma_lm)       
         
         # Need nopc version for null hypothesis
         if self._N_inv_nopc is None: # No reason to recompute these if done already
@@ -347,25 +344,24 @@ class anis_pta():
                 self._Lt_pc = _get_Lt(N_inv)
             Lt = self._Lt_pc
         else:
-            N_inv = self._N_inv_nopc
             # Without pair covariance, L = L.T = diag(1/sig)
             if self._Lt_nopc is None: # No reason to recompute these if done already
                 self._Lt_nopc = _get_Lt_nopc(self.sig)
             Lt = self._Lt_nopc
         
-        if basis in ['pixel', 'radiometer']:
-            model_orf = _map2orf(basis_decomposition, self.F_mat)
-        elif basis in ['sqrt', 'spherical']:
-            model_orf = basis_decomposition[0]*_clm2orf(basis_decomposition[1:], self.Gamma_lm)
-        iso_orf = _iso_fit(self.rho, Lt, self._HD, 2*jnp.array(np.random.rand(1))) # "prior" on A2 is [0,2] (temporarily)
-        return _orf2snr(model_orf, iso_orf, self.rho, N_inv, self._N_inv_nopc)
+        iso_orf, state = _iso_fit(self.rho, Lt, self._HD, 2*jnp.array(np.random.rand(1))) # "prior" on A2 is [0,2] (temporarily)
+        
+        if pair_cov:
+            return _orf2snr(model_orf, iso_orf, self.rho, N_inv, self._N_inv_nopc, self.sig, self.pair_cov)
+        else:
+            return _orf2snr_nopc(model_orf, iso_orf, self.rho, self._N_inv_nopc)
 
     def _make_cache(self):
         self._SQRT2 = jnp.sqrt(2)
         self._HD = jnp.array(self.get_pure_HD())
         self._c00 = jnp.array([jnp.sqrt(4*jnp.pi)])
         self._b00 = jnp.array([1])
-        self.pix_area = hp.nside2npix(self.nside)
+        self.pix_area = hp.nside2pixarea(self.nside)
         # Sqrt basis cache
         self._beta_vals = jnp.array(self.sqrt_basis_helper.beta_vals)
         self._blvals = jnp.array(self.sqrt_basis_helper.bl_idx)
@@ -375,9 +371,9 @@ class anis_pta():
         self._mvals = jnp.concatenate([jnp.arange(-ll, ll+1) for ll in range(0, self.l_max+1)])
         self._abs_mvals = jnp.abs(self._mvals)
         self._clm_mask = self._abs_mvals * (2 * self.l_max + 1 - self._abs_mvals) // 2 + self._lvals
-        self._m_vals_positive = self._mvals > 0
-        self._m_vals_negative = self._mvals < 0
-        self._m_vals_float_power = jnp.float_power(-1, self._mvals)
+        self._mvals_positive = self._mvals > 0
+        self._mvals_negative = self._mvals < 0
+        self._mvals_float_power = jnp.float_power(-1, self._mvals)
         self._blm_mask = self._abs_bmvals * (2*self.blmax+1 - self._abs_bmvals) // 2 + self._blvals
         self._blm_vals_float_power = jnp.float_power(-1, self._bmvals)
         self._bmvals_negative = self._bmvals < 0
@@ -471,14 +467,29 @@ def _clm2orf(clm, Gamma_lm):
         return clm @ Gamma_lm
 
 @jax.jit
-def _orf2snr(ani_orf, iso_orf, rho, N_inv, N_inv_nopc):
+def _orf2snr_nopc(ani_orf, iso_orf, rho, N_inv_nopc):
+    ani_res = rho - ani_orf
+    iso_res = rho - iso_orf
+    snm = (-1/2)*((ani_res).T @ N_inv_nopc @ (ani_res)) # Anisotropy chi-square
+    hdnm = (-1/2)*((iso_res).T @ N_inv_nopc @ (iso_res)) # Isotropy chi-square
+    nm = (-1/2)*((rho).T @ N_inv_nopc @ (rho)) # Null chi-square (Not pair covariant)
+    total_sn = 2 * (snm - nm)
+    iso_sn = 2 * (hdnm - nm)
+    anis_sn = 2 * (snm - hdnm)
+    return total_sn, iso_sn, anis_sn
+
+@jax.jit
+def _orf2snr(ani_orf, iso_orf, rho, N_inv, N_inv_nopc, sig, pair_cov_matrix):
+    det_sig = jnp.linalg.slogdet(jnp.diag(sig))[1]
+    det_paircov = jnp.linalg.slogdet(pair_cov_matrix)[1]
+    norm = det_sig - det_paircov
     ani_res = rho - ani_orf
     iso_res = rho - iso_orf
     snm = (-1/2)*((ani_res).T @ N_inv @ (ani_res)) # Anisotropy chi-square
     hdnm = (-1/2)*((iso_res).T @ N_inv @ (iso_res)) # Isotropy chi-square
     nm = (-1/2)*((rho).T @ N_inv_nopc @ (rho)) # Null chi-square (Not pair covariant)
-    total_sn = 2 * (snm - nm)
-    iso_sn = 2 * (hdnm - nm)
+    total_sn = 2 * (snm - nm + norm)
+    iso_sn = 2 * (hdnm - nm + norm)
     anis_sn = 2 * (snm - hdnm)
     return total_sn, iso_sn, anis_sn
 
