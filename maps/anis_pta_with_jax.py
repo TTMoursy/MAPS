@@ -1,3 +1,4 @@
+# This is mostly plagiarized from the rest of MAPS which was built by Kyle and Nihan
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
