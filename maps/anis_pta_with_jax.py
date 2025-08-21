@@ -6,6 +6,7 @@ import jaxopt # Can also move to Optimistix if ever preferred - JAXopt is a bit 
 import numpy as np
 import healpy as hp
 from . import clebschGordan as CG
+from enterprise.signals import anis_coefficients as ac
 
 # This file has the anis_pta class at the top and then the JAX functions at the bottom
 
@@ -129,11 +130,6 @@ class anis_pta():
         self.gw_theta, self.gw_phi = hp.pix2ang(nside=self.nside, ipix=np.arange(self.npix))
         
         self.sqrt_basis_helper = CG.clebschGordan(l_max = self.l_max)
-
-        if self.mode == 'power_basis':
-            self.ndim = 1 + (self.l_max + 1) ** 2
-        elif self.mode == 'sqrt_power_basis':
-            self.ndim = 1 + (self.blmax + 1) ** 2
 
         self.F_mat = jnp.array(self.antenna_response())
 
@@ -438,10 +434,10 @@ def _sqrt_basis(rho, Gamma_lm, Lt,
         blm = jnp.concatenate( (b00, params[1::2]+1j*params[2::2]) )
         real_blm = jnp.real(blm)
         blm = jnp.where(cache_bmvals_zero, real_blm, blm)
-        alm = blm2alm(blm, cache_beta_vals,
-                      cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative)
-        clm = alm2clm(alm,
-                      cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2)
+        alm = _blm2alm(blm, cache_beta_vals,
+                       cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative)
+        clm = _alm2clm(alm,
+                       cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2)
         orf = clm @ Gamma_lm
         model_orf = A2*orf
         r = rho - model_orf
@@ -451,10 +447,10 @@ def _sqrt_basis(rho, Gamma_lm, Lt,
     opt_blm = jnp.concatenate( (b00, opt_params[1::2]+1j*opt_params[2::2]) )
     real_opt_blm = jnp.real(opt_blm)
     opt_blm = jnp.where(cache_bmvals_zero, real_opt_blm, opt_blm)
-    opt_alm = blm2alm(opt_blm, cache_beta_vals,
-                      cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative)
-    opt_clm = alm2clm(opt_alm,
-                      cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2)
+    opt_alm = _blm2alm(opt_blm, cache_beta_vals,
+                       cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative)
+    opt_clm = _alm2clm(opt_alm,
+                       cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2)
     return opt_A2, opt_clm, state
 
 @jax.jit
@@ -488,8 +484,8 @@ def _orf2snr(ani_orf, iso_orf, rho, N_inv, N_inv_nopc):
 
 # utils functions
 @jax.jit
-def alm2clm(alm,
-            cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2):
+def _alm2clm(alm,
+             cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2):
     clm = alm[cache_clm_mask]
     cache_positive_m = cache_m_vals_float_power * jnp.real(clm) * SQRT2
     cache_negative_m = cache_m_vals_float_power * jnp.imag(clm) * SQRT2
@@ -499,8 +495,8 @@ def alm2clm(alm,
     return clm
 
 @jax.jit
-def blm2alm(blms_in, beta_vals,
-            cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative):
+def _blm2alm(blms_in, beta_vals,
+             cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative):
     blm_full = blms_in[cache_blm_mask]
     cache_blm_full = cache_blm_vals_float_power*jnp.conj(blm_full)
     blm_full = jnp.where(cache_bmvals_negative, cache_blm_full, blm_full)
@@ -516,10 +512,10 @@ def _get_N_inv(sig, C):
     A = jnp.diag(sig ** 2)
     K = C - A
     In = jnp.eye(A.shape[0])
-    return woodbury_inverse(A, In, In, K)
+    return _woodbury_inverse(A, In, In, K)
 
 @jax.jit
-def woodbury_inverse(A, U, C, V):
+def _woodbury_inverse(A, U, C, V):
     Ainv = jnp.diag( 1/jnp.diag(A) )
     Cinv = jnp.linalg.pinv(C)
     CVAU = Cinv + V @ Ainv @ U
