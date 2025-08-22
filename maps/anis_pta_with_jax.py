@@ -168,13 +168,15 @@ class anis_pta():
         # Read in OS and normalize cross-correlations by OS. 
         # (i.e. get <rho/OS> = <ORF>)
         self._Lt_pc, self._Lt_nopc = None, None # Reset the cholesky decompositions
-        self._N_inv, self._N_inv_nopc = None, None
+        self.pair_cov_N_inv, self.pair_ind_N_inv = None, None
         self._snr_norm = None
 
         if (rho is not None) and (sig is not None) and (os is not None):
             self.os = jnp.array(os)
             self.rho = jnp.array(rho) / self.os
             self.sig = jnp.array(sig) / self.os
+            self.pair_ind_N_inv = _get_N_inv_nopc(self.sig)
+            self._Lt_nopc = _get_Lt_nopc(self.sig)
 
         else:
             self.rho = None
@@ -183,9 +185,10 @@ class anis_pta():
 
         if covariance is not None:
             self.pair_cov = jnp.array(covariance) / self.os**2
-
+            self.pair_cov_N_inv = _get_N_inv(self.sig, self.pair_cov)
+            self._Lt_pc = _get_Lt(self.pair_cov_N_inv)
         else:
-            self.pair_cov = None    
+            self.pair_cov = None
 
     def _get_radec(self):
         """Get the pulsar positions in RA and DEC."""
@@ -288,20 +291,10 @@ class anis_pta():
 
     def anisotropy_recovery(self, basis, pair_cov):
         if pair_cov: 
-            if self._N_inv_pc is None: # No reason to recompute these if done already
-                self._N_inv_pc = _get_N_inv(self.sig, self.pair_cov)
-            N_inv = self._N_inv_pc
-            # Use the Cholesky decomposition to get L
-            if self._Lt_pc is None: # No reason to recompute these if done already
-                self._Lt_pc = _get_Lt(N_inv)
+            N_inv = self.pair_cov_N_inv
             Lt = self._Lt_pc
         else: 
-            if self._N_inv_nopc is None: # No reason to recompute these if done already
-                self._N_inv_nopc = _get_N_inv_nopc(self.sig)
-            N_inv = self._N_inv_nopc
-            # Without pair covariance, L = L.T = diag(1/sig)
-            if self._Lt_nopc is None: # No reason to recompute these if done already
-                self._Lt_nopc = _get_Lt_nopc(self.sig)
+            N_inv = self.pair_ind_N_inv
             Lt = self._Lt_nopc
             
         if basis == 'sqrt':
@@ -333,22 +326,9 @@ class anis_pta():
         elif basis in ['sqrt', 'spherical']:
             model_orf = basis_decomposition[0]*_clm2orf(basis_decomposition[1:], self.Gamma_lm)       
         
-        # Need nopc version for null hypothesis
-        if self._N_inv_nopc is None: # No reason to recompute these if done already
-            self._N_inv_nopc = _get_N_inv_nopc(self.sig)
-        
         if pair_cov: 
-            if self._N_inv_pc is None: # No reason to recompute these if done already
-                self._N_inv_pc = _get_N_inv(self.sig, self.pair_cov)
-            N_inv = self._N_inv_pc
-            # Use the Cholesky decomposition to get L
-            if self._Lt_pc is None: # No reason to recompute these if done already
-                self._Lt_pc = _get_Lt(N_inv)
             Lt = self._Lt_pc
         else:
-            # Without pair covariance, L = L.T = diag(1/sig)
-            if self._Lt_nopc is None: # No reason to recompute these if done already
-                self._Lt_nopc = _get_Lt_nopc(self.sig)
             Lt = self._Lt_nopc
         
         iso_orf, state = _iso_fit(self.rho, Lt, self._HD, 2*jnp.array(np.random.rand(1))) # "prior" on A2 is [0,2] (temporarily)
@@ -356,9 +336,9 @@ class anis_pta():
         if pair_cov:
             if self._snr_norm is None:
                 self._snr_norm = _get_snr_norm(self.sig, self.pair_cov)
-            return _orf2snr(model_orf, iso_orf, self.rho, N_inv, self._N_inv_nopc, self._snr_norm)
+            return _orf2snr(model_orf, iso_orf, self.rho, self.pair_cov_N_inv, self.pair_ind_N_inv, self._snr_norm)
         else:
-            return _orf2snr_nopc(model_orf, iso_orf, self.rho, self._N_inv_nopc)
+            return _orf2snr_nopc(model_orf, iso_orf, self.rho, self.pair_ind_N_inv)
 
     def _make_cache(self):
         self._SQRT2 = jnp.sqrt(2)
