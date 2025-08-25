@@ -316,7 +316,7 @@ class anis_pta():
 
     def get_snrs_squared(self, basis_decomposition, basis, pair_cov):
         # basis_decomposition is a pixel map if basis is 'radiometer' or 'pixel'
-        # basis_decomposition is a tuple, array, or list with the first element A2 and the rest the clms
+        # basis_decomposition is a tuple, array, or list with the first element A2 and the rest the clms if basis is 'sqrt' or 'spherical'
         # basis is 'radiometer', 'pixel', 'spherical', or 'sqrt'
         # pair_cov is True or False
         # returns the square of the total snr, iso snr, and anis snr
