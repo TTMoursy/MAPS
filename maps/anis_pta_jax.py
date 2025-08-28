@@ -10,6 +10,7 @@ from . import clebschGordan as CG
 from enterprise.signals import anis_coefficients as ac
 
 # This file has the anis_pta class at the top and then the JAX functions at the bottom
+# If anything is unclear, it may be better documented in the analogous function or method in the rest of MAPS, either in anis_pta.py or utils.py
 
 class anis_pta():
     """A class to perform anisotropic GW searches using PTA data.
@@ -43,19 +44,14 @@ class anis_pta():
         blm_size (int): The number of spherical harmonic modes for the sqrt power basis.
         gw_theta (np.ndarray): An array of source GW theta positions [npix].
         gw_phi (np.ndarray): An array of source GW phi positions [npix].
-        use_physical_prior (bool): Whether to use physical priors or not.
-        include_pta_monopole (bool): Whether to include the monopole term in the search.
-        mode (str): The mode of the spherical harmonic decomposition to use.
-            Must be 'power_basis', 'sqrt_power_basis', or 'hybrid'.
         sqrt_basis_helper (CG.clebschGordan): A helper object for the sqrt power basis.
-        ndim (int): The number of dimensions for the search.
         F_mat (np.ndarray): The antenna response matrix [npair x npix].
-        Gamma_lm (np.ndarray): The spherical harmonic basis [npair x ndim].
+        Gamma_lm (np.ndarray): The spherical harmonic basis [nclm x npair].
     """
 
     def __init__(self, psrs_theta, psrs_phi, xi = None, rho = None, sig = None, 
                  os = None, pair_cov = None, l_max = 6, nside = 2, 
-                 pair_idx = None): # always use physical prior when possible; always use forward modeling when possible; no support yet for monopole
+                 pair_idx = None):
         """Constructor for the anis_pta class.
 
         This function will construct an instance of the anis_pta class. This class
@@ -64,6 +60,13 @@ class anis_pta():
         (enterprise_extensions.frequentist.optimal_statistic or defiant/optimal_statistic).
         While you can include the OS values upon construction (xi, rho, sig, os),
         you can also use the method set_data() to set these values after construction.
+
+        No support yet for monopole, though that would be straightfoward to implement.
+        It's already in anis_pta.py. There is no flag for use_physical_prior. The sqrt
+        basis always returns physical recoveries by design. In this implementation, the
+        pixel basis also always returns physical recoveries, but the spherical and radiometer
+        bases are never guaranteed to. Forward modeling is always used except in the 
+        radiometer basis.
         
         Args:
             psrs_theta (np.ndarray): An array of pulsar position theta [npsr].
@@ -264,32 +267,30 @@ class anis_pta():
         xx = (1 - np.cos(self.xi)) / 2.
         hd_curve = 1.5 * xx * np.log(xx) - xx / 4 + 0.5
 
-        return hd_curve 
+        return hd_curve
 
-    def fisher_matrix_sph(self, pair_cov=False):
-        """A method to calculate the Fisher matrix for the spherical harmonic basis.
+    def anisotropy_recovery(self, basis, pair_cov):
+        """A method to do an anisotropy search given cross-correlations and relevant data.
 
         Args:
+            basis (str): Which basis the decomposition is to be computed with. Must be 'pixel', 'radiometer', 'sqrt', or 'spherical'.
             pair_cov (bool): A flag to use the pair covariance matrix if it was supplied
 
         Raises:
-            ValueError: If pair_cov is True and no pair covariance matrix is supplied.
+            ValueError: If pair_cov is True but no pair covariance matrix was supplied in initialization nor later with set_data().
+            NotImplementedError: If basis is 'eigenmaps'.
+            ValueError: If basis is not one of 'pixel', 'radiometer', 'sqrt', 'spherical', or 'eigenmaps'.
 
         Returns:
-            np.array: The Fisher matrix for the spherical harmonic basis. [n_clm x n_clm]
+            tuple: If basis is 'radiometer', returns two arrays of len npix: the radiometer map and uncertainty.
+                Otherwise, if basis is 'pixel', returns as the first output an npix map of the power decomposition in the pixel basis
+                and the other outputs are information about the fit from JAXopt.
+                Otherwise, if basis is 'sqrt' or 'spherical', returns as the first output a float which is A2, next an nclm array of 
+                the power decomposition, and the rest of the outputs are information about the fit from JAXopt.
         """
-        F_mat_clm = self.Gamma_lm.T
-
         if pair_cov and self.pair_cov is None:
             raise ValueError("No pair covariance matrix supplied! Set it with set_data()")
-        elif pair_cov:
-            fisher_mat = F_mat_clm.T @ self.pair_cov_N_inv @ F_mat_clm
-        else:
-            fisher_mat = F_mat_clm.T @ self.pair_ind_N_inv @ F_mat_clm 
-
-        return fisher_mat
-
-    def anisotropy_recovery(self, basis, pair_cov):
+        
         if pair_cov: 
             N_inv = self.pair_cov_N_inv
             Lt = self._Lt_pc
@@ -298,33 +299,47 @@ class anis_pta():
             Lt = self._Lt_nopc
             
         if basis == 'sqrt':
-            recovery = _sqrt_basis(self.rho, self.Gamma_lm, Lt,
-                                   self._bmvals_zero, self._blm_mask, self._blm_vals_float_power, self._bmvals_negative, self._beta_vals,
-                                   self._clm_mask, self._mvals_float_power, self._mvals_positive, self._mvals_negative, self._SQRT2,
-                                   jnp.array(np.random.rand(2*(self.blmax+1)**2 - 1)), self._b00) # "prior" on blm components is [0,1] (temporarily)
+            return _sqrt_basis(self.rho, self.Gamma_lm, Lt,
+                               self._bmvals_zero, self._blm_mask, self._blm_vals_float_power, self._bmvals_negative, self._beta_vals,
+                               self._clm_mask, self._mvals_float_power, self._mvals_positive, self._mvals_negative, self._SQRT2,
+                               jnp.array(np.random.uniform(-1,1,2*(self.blmax+1)**2 - 1)), self._b00) # Initial guess range on blm components is [-1,1) (maybe temporarily)
         elif basis == 'pixel':
-            recovery = _pixel_basis(self.rho, self.F_mat, Lt, 2*jnp.array(np.random.rand(self.npix))) # "prior" on pixel amplitudes is [0,2] (maybe temporarily)
+            return _pixel_basis(self.rho, self.F_mat, Lt, jnp.array(np.random.uniform(0,2,self.npix))) # Initial guess range on pixel amplitudes is [0,2) (maybe temporarily)
         elif basis == 'radiometer':
-            recovery = _radiometer_basis(self.rho, self.pix_area, N_inv, self.F_mat)
+            return _radiometer_basis(self.rho, self.pix_area, N_inv, self.F_mat)
         elif basis == 'spherical':
-            recovery = _sph_basis(self.rho, self.Gamma_lm, Lt, jnp.array(np.random.rand(self.clm_size)), self._c00) # "prior" on clms is [0,1] (temporarily)
+            return _sph_basis(self.rho, self.Gamma_lm, Lt, jnp.array(np.random.uniform(-1,1,self.clm_size)), self._c00) # Initial guess range on clms is [-1,1) (maybe temporarily)
         elif basis == 'eigenmaps':
             raise NotImplementedError('Basis not implemented yet!')
         else:
             raise ValueError('Basis not recognized!')
-        return recovery
 
     def get_snrs_squared(self, basis_decomposition, basis, pair_cov):
-        # basis_decomposition is a pixel map if basis is 'radiometer' or 'pixel'
-        # basis_decomposition is a tuple, array, or list with the first element A2 and the rest the clms if basis is 'sqrt' or 'spherical'
-        # basis is 'radiometer', 'pixel', 'spherical', or 'sqrt'
-        # pair_cov is True or False
-        # returns the square of the total snr, iso snr, and anis snr
+        """A method to calculate the square of the total, isotropic, and anisotropic SNRs given the recovered parameters of a search.
+
+        Args:
+            basis_decomposition (tuple, list, or np.ndarray): The recovered parameters of an anisotropy search.
+                This is the pixel values if basis is 'pixel' or 'radiometer' or, if basis is 'sqrt' or 'spherical', this should
+                contain 1+nclm elements, where the first element is A2 and the rest are the clms.
+            basis (str): Which basis the decomposition was computed with. Must be 'pixel', 'radiometer', 'sqrt', or 'spherical'.
+            pair_cov (bool): A flag to use the pair covariance matrix if it was supplied
+
+        Raises:
+            ValueError: If pair_cov is True but no pair covariance matrix was supplied in initialization nor later with set_data().
+            ValueError: If basis is not one of 'pixel', 'radiometer', 'sqrt', or 'spherical'.
+
+        Returns:
+            tuple: The square of the total, isotropic, and anisotropic SNRs.
+        """
+        if pair_cov and self.pair_cov is None:
+            raise ValueError("No pair covariance matrix supplied! Set it with set_data()")
         
         if basis in ['pixel', 'radiometer']:
             model_orf = _map2orf(basis_decomposition, self.F_mat)
         elif basis in ['sqrt', 'spherical']:
-            model_orf = basis_decomposition[0]*_clm2orf(basis_decomposition[1:], self.Gamma_lm)       
+            model_orf = basis_decomposition[0]*_clm2orf(basis_decomposition[1:], self.Gamma_lm)
+        else:
+            raise ValueError('Basis not recognized!')
         
         if pair_cov: 
             Lt = self._Lt_pc
@@ -341,6 +356,7 @@ class anis_pta():
             return _orf2snr_nopc(model_orf, iso_orf, self.rho, self.pair_ind_N_inv)
 
     def _make_cache(self):
+        # An internal method to cache some values and masks.
         self._SQRT2 = jnp.sqrt(2)
         self._HD = jnp.array(self.get_pure_HD())
         self._c00 = jnp.array([jnp.sqrt(4*jnp.pi)])
@@ -392,7 +408,7 @@ def _pixel_basis(rho, F_mat, Lt, params):
 @jax.jit
 def _sph_basis(rho, Gamma_lm, Lt, params, c00):
     def residuals(params):
-        A2 = 10**(params[0])
+        A2 = 10**(params[0]) # Model the amplitude in log-space.
         clm = jnp.concatenate( (c00,params[1:]) )
         orf = clm @ Gamma_lm
         model_orf = A2*orf
@@ -404,18 +420,19 @@ def _sph_basis(rho, Gamma_lm, Lt, params, c00):
     return opt_A2, opt_clm, state
 
 # almost unreadable from how much caching I'm using
+# it may help to see the equivalent function in anis_pta.py if wanting to understand the cached masks
 @jax.jit
 def _sqrt_basis(rho, Gamma_lm, Lt,
                 cache_bmvals_zero, cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative, cache_beta_vals,
                 cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2,
                 params, b00):
     def residuals(params):
-        A2 = 10**(2*jnp.sin(params[0]))
-        blm = jnp.concatenate( (b00, params[1::2]+1j*params[2::2]) )
+        A2 = 10**(2*jnp.sin(params[0])) # Model the amplitude in log-space. Use 2*sine to bound the parameter within 2 orders of magnitude.
+        blm = jnp.concatenate( (b00, params[1::2]+1j*params[2::2]) ) # After A2, the parameters alternate between real and imaginary components.
         real_blm = jnp.real(blm)
-        blm = jnp.where(cache_bmvals_zero, real_blm, blm)
-        alm = _blm2alm(blm, cache_beta_vals,
-                       cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative)
+        blm = jnp.where(cache_bmvals_zero, real_blm, blm) # bl0 is real rather than complex.
+        alm = _blm2alm(blm, 
+                       cache_beta_vals, cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative)
         clm = _alm2clm(alm,
                        cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2)
         orf = clm @ Gamma_lm
@@ -435,6 +452,8 @@ def _sqrt_basis(rho, Gamma_lm, Lt,
 
 @jax.jit
 def _iso_fit(rho, Lt, HD_curve, A2):
+    # Fit HD to rho by varying a single parameter A2. 
+    # Used in the null-hypothesis of the anisotropic SNR.
     def residuals(A2):
         model_orf = (jnp.sqrt(A2**2 + 1) - 1) * HD_curve # following LMFit for lower-bounded parameters; LMFit in turn follows MINUIT convention
         r = rho - model_orf
@@ -451,16 +470,17 @@ def _clm2orf(clm, Gamma_lm):
         return clm @ Gamma_lm
 
 @jax.jit
-def _orf2snr_nopc(ani_orf, iso_orf, rho, N_inv_nopc):
+def _orf2snr_nopc(ani_orf, iso_orf, rho, pair_ind_N_inv):
+    # Log-likelihood ratio between the various models.
     ani_res = rho - ani_orf
     iso_res = rho - iso_orf
-    snm = (-1/2)*((ani_res).T @ N_inv_nopc @ (ani_res)) # Anisotropy chi-square
-    hdnm = (-1/2)*((iso_res).T @ N_inv_nopc @ (iso_res)) # Isotropy chi-square
-    nm = (-1/2)*((rho).T @ N_inv_nopc @ (rho)) # Null chi-square (Not pair covariant)
-    total_sn = 2 * (snm - nm)
-    iso_sn = 2 * (hdnm - nm)
-    anis_sn = 2 * (snm - hdnm)
-    return total_sn, iso_sn, anis_sn
+    snm = (-1/2)*((ani_res).T @ pair_ind_N_inv @ (ani_res)) # Anisotropy chi-square
+    hdnm = (-1/2)*((iso_res).T @ pair_ind_N_inv @ (iso_res)) # Isotropy chi-square
+    nm = (-1/2)*((rho).T @ pair_ind_N_inv @ (rho)) # Null chi-square (Not pair covariant)
+    total_sn2 = 2 * (snm - nm)
+    iso_sn2 = 2 * (hdnm - nm)
+    anis_sn2 = 2 * (snm - hdnm)
+    return total_sn2, iso_sn2, anis_sn2
 
 @jax.jit
 def _get_snr_norm(sig, pair_cov_matrix):
@@ -469,16 +489,18 @@ def _get_snr_norm(sig, pair_cov_matrix):
     return 0.5*(det_sig - det_paircov)
 
 @jax.jit
-def _orf2snr(ani_orf, iso_orf, rho, N_inv, N_inv_nopc, snr_norm):
+def _orf2snr(ani_orf, iso_orf, rho, pair_cov_N_inv, pair_ind_N_inv, snr_norm):
+    # Log-likelihood ratio between the various models. 
+    # snr_norm accounts for the square-root of the determinants of Sigma and C.
     ani_res = rho - ani_orf
     iso_res = rho - iso_orf
-    snm = (-1/2)*((ani_res).T @ N_inv @ (ani_res)) # Anisotropy chi-square
-    hdnm = (-1/2)*((iso_res).T @ N_inv @ (iso_res)) # Isotropy chi-square
-    nm = (-1/2)*((rho).T @ N_inv_nopc @ (rho)) # Null chi-square (Not pair covariant)
-    total_sn = 2 * (snm - nm + snr_norm)
-    iso_sn = 2 * (hdnm - nm + snr_norm)
-    anis_sn = 2 * (snm - hdnm)
-    return total_sn, iso_sn, anis_sn
+    snm = (-1/2)*((ani_res).T @ pair_cov_N_inv @ (ani_res)) # Anisotropy chi-square
+    hdnm = (-1/2)*((iso_res).T @ pair_cov_N_inv @ (iso_res)) # Isotropy chi-square
+    nm = (-1/2)*((rho).T @ pair_ind_N_inv @ (rho)) # Null chi-square (Not pair covariant)
+    total_sn2 = 2 * (snm - nm + snr_norm)
+    iso_sn2 = 2 * (hdnm - nm + snr_norm)
+    anis_sn2 = 2 * (snm - hdnm)
+    return total_sn2, iso_sn2, anis_sn2
 
 # utils functions
 @jax.jit
@@ -493,7 +515,7 @@ def _alm2clm(alm,
     return clm
 
 @jax.jit
-def _blm2alm(blms_in, beta_vals,
+def _blm2alm(blms_in, beta_vals, 
              cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative):
     blm_full = blms_in[cache_blm_mask]
     cache_blm_full = cache_blm_vals_float_power*jnp.conj(blm_full)
