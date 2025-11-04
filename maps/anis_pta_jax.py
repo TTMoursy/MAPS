@@ -397,13 +397,13 @@ def _radiometer_basis(rho, pix_area, N_inv, F_mat):
 @jax.jit
 def _pixel_basis(rho, F_mat, Lt, params):
     def residuals(params):
-        power_map = jnp.sqrt(params**2 + 1) - 1 # Apply non-negativity constraint using LMFit's convention, which uses the MINUIT convention
-        model_orf = F_mat @ power_map
+        pixel_map = 10**params
+        model_orf = F_mat @ pixel_map
         r = rho - model_orf
         return Lt @ r
     opt_params, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run(params)
-    opt_power_map = jnp.sqrt(opt_params**2 + 1) - 1
-    return opt_power_map, state
+    opt_pixel_map = 10**opt_params
+    return opt_pixel_map, state
 
 @jax.jit
 def _sph_basis(rho, Gamma_lm, Lt, params, c00):
