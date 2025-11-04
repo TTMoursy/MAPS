@@ -535,12 +535,13 @@ def _get_N_inv(sig, C):
     return _woodbury_inverse(A, In, In, K)
 
 @jax.jit
-def _woodbury_inverse(A, U, C, V):
-    Ainv = jnp.diag( 1/jnp.diag(A) )
-    Cinv = jnp.linalg.pinv(C)
-    CVAU = Cinv + V @ Ainv @ U
-    tot_inv = Ainv - Ainv @ U @ jnp.linalg.solve(CVAU, V @ Ainv)
-    return tot_inv
+def _woodbury_inverse(A, U, C, V): 
+    # basically from stack overflow 
+    # assumes C is the identity
+    # has benefit of vector multiplication instead of diagonal matrix multiplication
+    A_inv_diag = 1/jnp.diag(A) 
+    B_inv = jnp.linalg.inv(C + (V * A_inv_diag) @ U)
+    return jnp.diag(A_inv_diag) - (A_inv_diag.reshape(-1,1) * U @ B_inv @ V * A_inv_diag)
 
 @jax.jit
 def _get_Lt(N_inv):
