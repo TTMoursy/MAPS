@@ -401,7 +401,7 @@ def _pixel_basis(rho, F_mat, Lt, params):
         model_orf = F_mat @ power_map
         r = rho - model_orf
         return Lt @ r
-    opt_params, state = jax.jit(jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run)(params)
+    opt_params, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run(params)
     opt_power_map = jnp.sqrt(opt_params**2 + 1) - 1
     return opt_power_map, state
 
@@ -414,7 +414,7 @@ def _sph_basis(rho, Gamma_lm, Lt, params, c00):
         model_orf = A2*orf
         r = rho - model_orf
         return Lt @ r
-    opt_params, state = jax.jit(jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run)(params)
+    opt_params, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run(params)
     opt_A2 = 10**(opt_params[0])
     opt_clm = jnp.concatenate( (c00,opt_params[1:]) )
     return opt_A2, opt_clm, state
@@ -439,7 +439,7 @@ def _sqrt_basis(rho, Gamma_lm, Lt,
         model_orf = A2*orf
         r = rho - model_orf
         return Lt @ r
-    opt_params, state = jax.jit(jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run)(params)
+    opt_params, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run(params)
     opt_A2 = 10**(2*jnp.sin(opt_params[0]))
     opt_blm = jnp.concatenate( (b00, opt_params[1::2]+1j*opt_params[2::2]) )
     real_opt_blm = jnp.real(opt_blm)
@@ -458,7 +458,7 @@ def _iso_fit(rho, Lt, HD_curve, A2):
         model_orf = (jnp.sqrt(A2**2 + 1) - 1) * HD_curve # following LMFit for lower-bounded parameters; LMFit in turn follows MINUIT convention
         r = rho - model_orf
         return Lt @ r
-    opt_A2, state = jax.jit(jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run)(A2)
+    opt_A2, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run(A2)
     return (jnp.sqrt(opt_A2**2 + 1) - 1)*HD_curve, state
 
 @jax.jit
