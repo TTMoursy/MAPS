@@ -283,10 +283,10 @@ class anis_pta():
 
         Returns:
             tuple: If basis is 'radiometer', returns two arrays of len npix: the radiometer map and uncertainty.
-                Otherwise, if basis is 'pixel', returns as the first output an npix map of the power decomposition in the pixel basis
-                and the other outputs are information about the fit from JAXopt.
+                Otherwise, if basis is 'pixel', returns as the first output an npix map of the power decomposition in the pixel basis,
+                and the second output contains information about the optimal step from JAXopt.
                 Otherwise, if basis is 'sqrt' or 'spherical', returns as the first output a float which is A2, next an nclm array of 
-                the power decomposition, and the rest of the outputs are information about the fit from JAXopt.
+                the power decomposition, and the third output contains information about the optimal step from JAXopt.
         """
         if pair_cov and self.pair_cov is None:
             raise ValueError("No pair covariance matrix supplied! Set it with set_data()")
@@ -302,13 +302,13 @@ class anis_pta():
             return _sqrt_basis(self.rho, self.Gamma_lm, Lt,
                                self._bmvals_zero, self._blm_mask, self._blm_vals_float_power, self._bmvals_negative, self._beta_vals,
                                self._clm_mask, self._mvals_float_power, self._mvals_positive, self._mvals_negative, self._SQRT2,
-                               jnp.array(np.random.uniform(-1,1,2*(self.blmax+1)**2 - 1)), self._b00) # Initial guess range on blm components is [-1,1) (maybe temporarily)
+                               jnp.array(np.random.uniform(-1,1,2*(self.blmax+1)**2 - 1)), self._b00)
         elif basis == 'pixel':
-            return _pixel_basis(self.rho, self.F_mat, Lt, jnp.array(np.random.uniform(0,2,self.npix))) # Initial guess range on pixel amplitudes is [0,2) (maybe temporarily)
+            return _pixel_basis(self.rho, self.F_mat, Lt, jnp.array(np.random.uniform(-1,1,self.npix)))
         elif basis == 'radiometer':
             return _radiometer_basis(self.rho, self.pix_area, N_inv, self.F_mat)
         elif basis == 'spherical':
-            return _sph_basis(self.rho, self.Gamma_lm, Lt, jnp.array(np.random.uniform(-1,1,self.clm_size)), self._c00) # Initial guess range on clms is [-1,1) (maybe temporarily)
+            return _sph_basis(self.rho, self.Gamma_lm, Lt, jnp.array(np.random.uniform(-1,1,self.clm_size)), self._c00)
         elif basis == 'eigenmaps':
             raise NotImplementedError('Basis not implemented yet!')
         else:
@@ -319,7 +319,7 @@ class anis_pta():
 
         Args:
             basis_decomposition (tuple, list, or np.ndarray): The recovered parameters of an anisotropy search.
-                This is the pixel values if basis is 'pixel' or 'radiometer' or, if basis is 'sqrt' or 'spherical', this should
+                This is an npix tuple, list, or array of pixel values if basis is 'pixel' or 'radiometer' or, if basis is 'sqrt' or 'spherical', this should
                 contain 1+nclm elements, where the first element is A2 and the rest are the clms.
             basis (str): Which basis the decomposition was computed with. Must be 'pixel', 'radiometer', 'sqrt', or 'spherical'.
             pair_cov (bool): A flag to use the pair covariance matrix if it was supplied
@@ -346,7 +346,7 @@ class anis_pta():
         else:
             Lt = self._Lt_nopc
         
-        iso_orf, state = _iso_fit(self.rho, Lt, self._HD, 2*jnp.array(np.random.rand(1))) # "prior" on A2 is [0,2] (temporarily)
+        iso_orf, state = _iso_fit(self.rho, Lt, self._HD, 2*jnp.array(np.random.uniform(-1,1)))
         
         if pair_cov:
             if self._snr_norm is None:
@@ -451,15 +451,15 @@ def _sqrt_basis(rho, Gamma_lm, Lt,
     return opt_A2, opt_clm, state
 
 @jax.jit
-def _iso_fit(rho, Lt, HD_curve, A2):
+def _iso_fit(rho, Lt, HD_curve, logA2):
     # Fit HD to rho by varying a single parameter A2. 
     # Used in the null-hypothesis of the anisotropic SNR.
-    def residuals(A2):
-        model_orf = (jnp.sqrt(A2**2 + 1) - 1) * HD_curve # following LMFit for lower-bounded parameters; LMFit in turn follows MINUIT convention
+    def residuals(logA2):
+        model_orf = 10**logA2 * HD_curve # following LMFit for lower-bounded parameters; LMFit in turn follows MINUIT convention
         r = rho - model_orf
         return Lt @ r
-    opt_A2, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run(A2)
-    return (jnp.sqrt(opt_A2**2 + 1) - 1)*HD_curve, state
+    opt_logA2, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run(logA2)
+    return 10**opt_logA2 * HD_curve, state
 
 @jax.jit
 def _map2orf(pixel_map, F_mat):
