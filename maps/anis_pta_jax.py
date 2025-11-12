@@ -3,7 +3,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from jax.scipy.integrate import trapezoid
-import jaxopt # Can also move to Optimistix if ever preferred - JAXopt is a bit faster in my testing and more intuitive (and more stylish in my opinion)
+import jaxopt # Can also move to Optimistix if ever preferred - JAXopt is a bit faster in my testing
 import numpy as np
 import healpy as hp
 from . import clebschGordan as CG
@@ -452,10 +452,10 @@ def _sqrt_basis(rho, Gamma_lm, Lt,
 
 @jax.jit
 def _iso_fit(rho, Lt, HD_curve, logA2):
-    # Fit HD to rho by varying a single parameter A2. 
+    # Fit HD to rho by varying a single parameter logA2. 
     # Used in the null-hypothesis of the anisotropic SNR.
     def residuals(logA2):
-        model_orf = 10**logA2 * HD_curve # following LMFit for lower-bounded parameters; LMFit in turn follows MINUIT convention
+        model_orf = 10**logA2 * HD_curve
         r = rho - model_orf
         return Lt @ r
     opt_logA2, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run(logA2)
