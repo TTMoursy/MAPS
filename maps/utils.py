@@ -176,6 +176,8 @@ def angular_power_spectrum(clm):
     This function computes the angular power spectrum from the spherical harmonic coefficients
     by taking the average of the square of the coefficients for each l.
 
+    NOTE: clm should include c_00 term and be of length (l_max + 1)^2.
+
     Args:
         clm (np.ndarray): The array of spherical harmonic coefficients
 
@@ -183,22 +185,18 @@ def angular_power_spectrum(clm):
         C_l: The angular power spectrum per spherical harmonic l.
     """
 
-    maxl = int(np.sqrt(clm.shape[0]))
-    new_clm2 = clm ** 2
+    maxl = int(np.sqrt(clm.shape[0])) - 1
+    clm2 = clm ** 2
 
-    C_l = np.zeros((maxl))
+    C_l = np.zeros((maxl + 1))
     idx = 0
 
-    for ll in range(maxl):
-        if ll == 0:
-            C_l[ll] = new_clm2[ll]
-            idx += 1
-        else:
-            subset_len = 2 * ll + 1
-            subset = np.arange(idx, idx + subset_len)
+    for ll in range(maxl+1):
+        subset_len = 2*ll + 1
+        subset = np.arange(idx, idx + subset_len)
 
-            C_l[ll] = np.sum(new_clm2[subset]) / (2 * ll + 1)
-            idx = subset[-1]
+        C_l[ll] = np.sum(clm2[subset]) / (2 * ll + 1)
+        idx = subset[-1] + 1
 
     return C_l
 
