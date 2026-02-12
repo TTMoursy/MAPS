@@ -9,7 +9,7 @@ setup(
     # Needed to actually package something
     packages=['maps'],
     # Needed for dependencies
-    install_requires=['numpy', 'scipy', 'sympy', 'astroML', 'PTMCMCSampler', 'healpy', 'lmfit', 'jax', 'jaxopt'],
+    install_requires=['numpy', 'scipy', 'sympy', 'astroML', 'PTMCMCSampler', 'healpy', 'lmfit', 'jax', 'optimistix'],
     # *strongly* suggested for sharing
     version='0.4.4',
     # The license can be anything you like
