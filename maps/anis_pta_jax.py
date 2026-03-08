@@ -315,6 +315,8 @@ def make_blm2alm_cache(l_max):
     blm2alm_cache = []
     blmax = l_max // 2
     precomputed_CG_directory = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'precomputed_clebschGordan')
+    if not os.path.exists(precomputed_CG_directory):
+        os.makedirs(precomputed_CG_directory, exist_ok=True)
     precomputed_CG_filename = os.path.join(precomputed_CG_directory, 'lmax'+str(l_max)+'.npz')
     if os.path.exists(precomputed_CG_filename):
         sqrt_basis_helper = np.load(precomputed_CG_filename)
