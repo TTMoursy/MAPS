@@ -238,17 +238,16 @@ def createSignalResponse_pol(pphi, ptheta, gwphi, gwtheta, p):
     return Fp, Fc
 
 def spherical_response(Fp, Fc, gwtheta, gwphi, l_max):
-    """A function to compute the spherical harmonic basis antenna response matrix R_{clm, ab}.
+    """A function to compute the spherical harmonic basis antenna response matrix R_{clm, a, b}.
 
     This function computes the spherical harmonics basis antenna response 
-    matrix R_{clm, ab} where ab represents the pulsar pair made of pulsars 
-    a and b, and k represents the pixel index.
+    matrix R_{clm, a, b} where a and b are pulsars.
     NOTE: This function uses the GW propogation direction for gwtheta and gwphi
     rather than the source direction (i.e. this method uses the vector from the
     source to the observer)
 
     Returns:
-        jax.Array: An array of shape (nclm, npairs) containing the antenna
+        jax.Array: An array of shape (nclm, npsr, npsr) containing the antenna
             pattern response matrix.
     """
     FpFc = jnp.zeros((Fp.shape[0], 2*Fp.shape[1])).at[:,0::2].set(Fp).at[:,1::2].set(Fc)
@@ -589,11 +588,11 @@ def _spherical_response(FpFc, ylm_maps):
 
     Args:
         FpFc (jax.Array or np.ndarray): The PTA response matrices interweaved by polarization into a single matrix which has
-            size npair by 2*npix.
+            size npsr by 2*npix.
         ylm_maps (jax.Array or np.ndarray): The spherical harmonics evaluated on a HEALPix grid. Get this from _compute_ylm_maps.
             Should be size nclm by npix.
     Returns:
-        jax.Array: The response matrix of size nclm by npair.
+        jax.Array: The response matrix of size nclm by npsr by npsr.
     """
     ylm_maps_both_polarizations = jnp.repeat(ylm_maps, 2).reshape(ylm_maps.shape[0], -1)
 
