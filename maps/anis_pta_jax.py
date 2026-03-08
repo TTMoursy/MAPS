@@ -4,7 +4,6 @@ import jax
 jax.config.update("jax_enable_x64", True)
 from jax import jit, vmap
 import jax.numpy as jnp
-from jax.lax import cond
 from jax.scipy.special import sph_harm_y # used for constructing spherical harmonic basis
 import jaxopt # optimistix has a nice Nelder-Mead implementation
 from functools import partial
