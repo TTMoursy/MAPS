@@ -1,556 +1,674 @@
 # This is mostly plagiarized from the rest of MAPS which was built by Kyle and Nihan
+# and also anis_coefficients in ENTERPRISE which was built by Steve and Rutger
 import jax
 jax.config.update("jax_enable_x64", True)
+from jax import jit, vmap
 import jax.numpy as jnp
-from jax.scipy.integrate import trapezoid
-import jaxopt # Can also move to Optimistix if ever preferred - JAXopt is a bit faster in my testing
-import numpy as np
-import healpy as hp
-from . import clebschGordan as CG
-from enterprise.signals import anis_coefficients as ac
+from jax.lax import cond
+from jax.scipy.special import sph_harm_y # used for constructing spherical harmonic basis
+import jaxopt # optimistix has a nice Nelder-Mead implementation
+from functools import partial
+import numpy as np, healpy as hp, os
 
-# This file has the anis_pta class at the top and then the JAX functions at the bottom
-# If anything is unclear, it may be better documented in the analogous function or method in the rest of MAPS, either in anis_pta.py or utils.py
-
-class anis_pta():
-    """A class to perform anisotropic GW searches using PTA data.
-
-    This class can be used to perform anisotropic GW searches using PTA data by supplying
-    it with the outputs of the PTA optimal statistic which can be found in
-    (enterprise_extensions.frequentist.optimal_statistic or defiant/optimal_statistic).
-    While you can include the OS values upon construction (xi, rho, sig, os),
-    you can also use the method set_data() to set these values after construction.
-
-    Attributes:
-        psrs_theta (np.ndarray): An array of pulsar position theta [npsr].
-        psrs_phi (np.ndarray): An array of pulsar position phi [npsr].
-        npsr (int): The number of pulsars in the PTA.
-        npair (int): The number of pulsar pairs.
-        pair_idx (np.ndarray): An array of pulsar indices for each pair [npair x 2].
-        xi (np.ndarray, optional): A list of pulsar pair separations from the OS [npair].
-        rho (np.ndarray, optional): A list of pulsar pair correlations [npair].
-            NOTE: rho is normalized by the OS value, making this slightly different from 
-            what the OS uses. (i.e. OS calculates hat{A}^2 * ORF while this uses ORF).
-        sig (np.ndarray, optional): A list of 1-sigma uncertainties on rho [npair].
-        os (float, optional): The optimal statistic's best-fit A^2 value.
-        pair_cov (np.ndarray, optional): The pair covariance matrix [npair x npair].
-        pair_ind_N_inv (np.ndarray): The inverse of the pair independent covariance matrix.
-        pair_cov_N_inv (np.ndarray): The inverse of the pair covariance matrix.
-        l_max (int): The maximum l value for spherical harmonics.
-        nside (int): The nside of the healpix sky pixelization.
-        npix (int): The number of pixels in the healpix pixelization.
-        blmax (int): The maximum l value for the sqrt power basis.
-        clm_size (int): The number of spherical harmonic modes.
-        blm_size (int): The number of spherical harmonic modes for the sqrt power basis.
-        gw_theta (np.ndarray): An array of source GW theta positions [npix].
-        gw_phi (np.ndarray): An array of source GW phi positions [npix].
-        sqrt_basis_helper (CG.clebschGordan): A helper object for the sqrt power basis.
-        F_mat (np.ndarray): The antenna response matrix [npair x npix].
-        Gamma_lm (np.ndarray): The spherical harmonic basis [nclm x npair].
+def correlations2anisotropy(psrs_theta, psrs_phi, rho, S, C, basis, 
+                            nside = 8, l_max = 8, maxiter = 30, tol = 1e-5):
     """
-
-    def __init__(self, psrs_theta, psrs_phi, xi = None, rho = None, sig = None, 
-                 os = None, pair_cov = None, l_max = 6, nside = 2, 
-                 pair_idx = None):
-        """Constructor for the anis_pta class.
-
-        This function will construct an instance of the anis_pta class. This class
-        can be used to perform anisotropic GW searches using PTA data by supplying
-        it with the outputs of the PTA optimal statistic which can be found in 
-        (enterprise_extensions.frequentist.optimal_statistic or defiant/optimal_statistic).
-        While you can include the OS values upon construction (xi, rho, sig, os),
-        you can also use the method set_data() to set these values after construction.
-
-        No support yet for monopole, though that would be straightfoward to implement.
-        It's already in anis_pta.py. There is no flag for use_physical_prior. The sqrt
-        basis always returns physical recoveries by design. In this implementation, the
-        pixel basis also always returns physical recoveries, but the spherical and radiometer
-        bases are never guaranteed to. Forward modeling is always used except in the 
-        radiometer basis.
-        
-        Args:
-            psrs_theta (np.ndarray): An array of pulsar position theta [npsr].
-            psrs_phi (np.ndarray): An array of pulsar position phi [npsr].
-            xi (np.ndarray, optional): A list of pulsar pair separations from the OS [npair].
-            rho (np.ndarray, optional): A list of pulsar pair correlations [npair].
-            sig (np.ndarray, optional): A list of 1-sigma uncertainties on rho [npair].
-            os (float, optional): The optimal statistic's best-fit A^2 value.
-            pair_cov (np.ndarray, optional): The pair covariance matrix [npair x npair].
-            l_max (int): The maximum l value for spherical harmonics.
-            nside (int): The nside of the healpix sky pixelization.
-            mode (str): The mode of the spherical harmonic decomposition to use.
-                Must be 'power_basis', 'sqrt_power_basis', or 'hybrid'.
-            use_physical_prior (bool): Whether to use physical priors or not.
-            include_pta_monopole (bool): Whether to include the monopole term in the search.
-            pair_idx (np.ndarray, optional): An array of pulsar indices for each pair [npair x 2].
-
-        Raises:
-            ValueError: If the lengths of psrs_theta and psrs_phi are not equal.
-            ValueError: If the length of pair_idx is not equal to the number of pulsar pairs.            
-        """
-        # Pulsar positions
-        self.psrs_theta = psrs_theta if type(psrs_theta) is np.ndarray else np.array(psrs_theta)
-        self.psrs_phi = psrs_phi if type(psrs_phi) is np.ndarray else np.array(psrs_phi)
-        if len(psrs_theta) != len(psrs_phi):
-            raise ValueError("Pulsar theta and phi arrays must have the same length")
-        self.npsr = len(psrs_theta)
-        self.npairs = int( (self.npsr * (self.npsr - 1)) / 2)
-
-        # OS values
-        if pair_idx is None:
-            self.pair_idx = np.array([(a,b) for a in range(self.npsr) for b in range(a+1,self.npsr)])
-        else:
-            self.pair_idx = pair_idx
-        
-        if xi is not None:
-            if type(xi) is not np.ndarray:
-                self.xi = np.array(xi)
-            else:
-                self.xi = xi
-        else:
-            self.xi = self._get_xi()
-
-        self.rho, self.sig, self.os, self.pair_cov = None, None, None, None
-        self.pair_ind_N_inv, self.pair_cov_N_inv = None, None
-
-        self.set_data(rho, sig, os, pair_cov)
-        
-        # Check if pair_idx is valid
-        if len(self.pair_idx) != self.npairs:
-            raise ValueError("pair_idx must have length equal to the number of pulsar pairs")
-        
-        # Pixel decomposition and Spherical harmonic parameters
-        self.l_max = int(l_max)
-        self.nside = int(nside)
-        self.npix = hp.nside2npix(self.nside)
-
-        # Some configuration for spherical harmonic basis runs
-        # clm refers to normal spherical harmonic basis
-        # blm refers to sqrt power spherical harmonic basis
-        self.blmax = int(self.l_max / 2.)
-        self.clm_size = (self.l_max + 1) ** 2
-        self.blm_size = hp.Alm.getsize(self.blmax)
-
-        self.gw_theta, self.gw_phi = hp.pix2ang(nside=self.nside, ipix=np.arange(self.npix))
-        
-        self.sqrt_basis_helper = CG.clebschGordan(l_max = self.l_max)
-
-        self.F_mat = jnp.array(self.antenna_response())
-
-        # The spherical harmonic basis for \Gamma_lm_mat shape (nclm, npsrs, npsrs)
-        Gamma_lm_mat = ac.anis_basis(np.dstack((self.psrs_phi, self.psrs_theta))[0], 
-                                 lmax = self.l_max, nside = self.nside) # This takes a few seconds and could maybe be vectorized
-        
-        # We need to reorder Gamma_lm_mat to shape (nclm, npairs)
-        self.Gamma_lm = jnp.array(Gamma_lm_mat[:, self.pair_idx[:,0], self.pair_idx[:,1]])
-
-        self._make_cache()
-                     
-        return None
+    A function to do an anisotropy search given cross-correlations and relevant data.
     
+    Notes:
+    This function supports batched fitting and GPU-accleration automatically. For batched fitting, supply multi-dimensional
+    (up to 3 dimensions) rho, S, and C inputs corresponding to noise-marginalization, per-frequency, or both.
+    For very large-scale analyses, it may be more efficient to construct your own tailored script based on the specifics of
+    the analysis rather than using this function.
+    The covariance matrix can be pair covariant or not; both methods are supported. This only uses the Levenberg-Marquardt 
+    algorithm for now for fitting the cross-correlations. More algorithms may be added in the future.
+
+    Args:
+        psrs_theta (ArrayLike): 1d ArrayLike of theta values in radians of pulsar positions. Used in constructing the PTA response.
+        psrs_phi (ArrayLike): 1d ArrayLike of phi values in radians of pulsar positions. Used in constructing the PTA response.
+        rho (ArrayLike): ArrayLike, typically 1d, of cross-correlations output from Defiant. Can be supplied as a 2d array if
+            noise-marginalization or per-frequency was used, and can also be supplied as a 3d array with both noise-marginalization
+            and per-frequency.
+        S (float or ArrayLike): float or ArrayLike containing the amplitudes output from Defiant. Should be same dimensionality as
+            rho unless rho is 1d and S is scalar, which is okay as well.
+        C (ArrayLike): ArrayLike corresponding to the covariance matrix output from Defiant. Should be the dimensionality of rho
+            plus 1.
+        basis (str): Which basis the decomposition is to be computed with. Must be 'pixel', 'radiometer', 'sqrt', or 'spherical'.
+        nside (int): What Nside (resolution) to use for the pixel and radiometer bases. This is NOT ignored even if basis is neither
+            pixel nor radiometer because a radiometer map is always constructed as an initial guess regardless of basis.
+            Defaults to 8.
+        l_max (int): What l_max (resolution parameter) to use for the sqrt and spherical bases. This is ignored if basis is pixel
+            or radiometer. Defaults to 8.
+        maxiter (int): How many iterations to use for solving. Defaults to 30. Ignored if basis is 'radiometer'.
+        tol (float): Tolerance for ending the solve. Defaults to 1e-5. Ignored if basis is 'radiometer'.
+
+    Raises:
+        ValueError: If the number of dimensions of rho is not 1, 2, or 3, corresponding to one set of correlations or possible 
+            noise-marginalization and/or per-frequency sets of correlations.
+        ValueError: If basis is not one of 'pixel', 'radiometer', 'sqrt', or 'spherical'.
+
+    Returns:
+        tuple: A two-element tuple with the basis decomposition as the first output and the squared anisotropic SNR as the second.
+    """
+    # make sure inputs are JAX arrays
+    psrs_theta = jnp.array(psrs_theta)
+    psrs_phi = jnp.array(psrs_phi)
+    rho = jnp.array(rho)
+    C = jnp.array(C)
     
-    def set_data(self, rho=None, sig=None, os=None, covariance=None):
-        """Set the data for the anis_pta object.
-
-        This function allows you to set the data for the anis_pta object 
-        after construction. This allows users to use the same anis_pta object
-        with different draws of the data. This is especially helpful when combined
-        with the noise marginalized optimal statistic or per-frequency optimal statistic 
-        analyses. This function will normalize the rho, sig, and covariance by the 
-        OS (A^2) value, making self.rho, self.sig, and self.pair_cov represent only 
-        the correlations. 
-        NOTE: If using pair covariance you still need to supply this function
-        with the pairwise uncertainties as well!
-
-        Args:
-            rho (list, optional): A list of pulsar pair correlated amplitudes (<rho> = <A^2*ORF>).
-            sig (list, optional): A list of 1-sigma uncertaintties on rho.
-            os (float, optional): The OS' fit A^2 value.
-            covariance (np.ndarray, optional): The pair covariance matrix [npair x npair].
-        """
-        # Read in OS and normalize cross-correlations by OS. 
-        # (i.e. get <rho/OS> = <ORF>)
-        self._Lt_pc, self._Lt_nopc = None, None # Reset the cholesky decompositions
-        self.pair_cov_N_inv, self.pair_ind_N_inv = None, None
-        self._snr_norm = None
-
-        if (rho is not None) and (sig is not None) and (os is not None):
-            self.os = jnp.array(os)
-            self.rho = jnp.array(rho) / self.os
-            self.sig = jnp.array(sig) / self.os
-            self.pair_ind_N_inv = _get_N_inv_nopc(self.sig)
-            self._Lt_nopc = _get_Lt_nopc(self.sig)
-
-        else:
-            self.rho = None
-            self.sig = None
-            self.os = None
-
-        if covariance is not None:
-            self.pair_cov = jnp.array(covariance) / self.os**2
-            self.pair_cov_N_inv = _get_N_inv(self.sig, self.pair_cov)
-            self._Lt_pc = _get_Lt(self.pair_cov_N_inv)
-        else:
-            self.pair_cov = None
-
-    def _get_radec(self):
-        """Get the pulsar positions in RA and DEC."""
-        psr_ra = self.psrs_phi
-        psr_dec = (np.pi/2) - self.psrs_theta
-        return psr_ra, psr_dec
-
-
-    def _get_xi(self):
-        """Calculate the angular separation between pulsar pairs.
-
-        A function to compute the angular separation between pulsar pairs. This
-        function will use a pair_idx array which is assigned upon construction 
-        which ensures that the ordering of the pairs is consistent with the OS.
-
-        Returns:
-            np.ndarray: An array of pair separations.
-        """
-        psrs_ra, psrs_dec = self._get_radec()
-
-        x = np.cos(psrs_ra)*np.cos(psrs_dec)
-        y = np.sin(psrs_ra)*np.cos(psrs_dec)
-        z = np.sin(psrs_dec)
-        
-        pos_vectors = np.array([x,y,z])
-
-        a,b = self.pair_idx[:,0], self.pair_idx[:,1]
-
-        xi = np.zeros( len(a) )
-        # This effectively does a dot product of pulsar position vectors for all pairs a,b
-        pos_dot = np.einsum('ij,ij->j', pos_vectors[:,a], pos_vectors[:, b])
-        xi = np.arccos( pos_dot )
-
-        return np.squeeze(xi)
-
-    def antenna_response(self):
-        """A function to compute the antenna response matrix R_{ab,k}.
-
-        This function computes the antenna response matrix R_{ab,k} where ab 
-        represents the pulsar pair made of pulsars a and b, and k represents
-        the pixel index. 
-        NOTE: This function uses the GW propogation direction for gwtheta and gwphi
-        rather than the source direction (i.e. this method uses the vector from the
-        source to the observer)
-
-        Returns:
-            np.ndarray: An array of shape (npairs, npix) containing the antenna
-                pattern response matrix.
-        """
-        npix = hp.nside2npix(self.nside)
-        gwtheta,gwphi = hp.pix2ang(self.nside,np.arange(npix))
-
-        FpFc = ac.signalResponse_fast(self.psrs_theta, self.psrs_phi, gwtheta, gwphi)
-        Fp,Fc = FpFc[:,0::2], FpFc[:,1::2] 
-
-        R_abk = Fp[self.pair_idx[:,0]]*Fp[self.pair_idx[:,1]] + Fc[self.pair_idx[:,0]]*Fc[self.pair_idx[:,1]]
-
-        return R_abk
+    # check for scalar amplitude
+    if not hasattr(S, '__len__'):
+        S = jnp.array([S])
+    else:
+        S = jnp.array(S)
+        if S.ndim < rho.ndim:
+            S = S[..., None] # [1,2,3] -> [[1],[2],[3]] (to make it compatible with vmap)
     
+    # Construct responses
+    pair_idx = jnp.array(jnp.triu_indices(len(psrs_theta),1)).T
+    gwtheta, gwphi = hp.pix2ang(nside, np.arange(12*nside**2))
+    gwtheta, gwphi = jnp.array(gwtheta), jnp.array(gwphi)
+    
+    R, Fp, Fc = signalResponse_fast(psrs_theta, psrs_phi, gwtheta, gwphi, pair_idx[:,0], pair_idx[:,1]) # npix x npair
+    if basis in ('sqrt', 'spherical'):
+        Gamma_lm = spherical_response(Fp, Fc, gwtheta, gwphi, l_max)[:, pair_idx[:,0], pair_idx[:,1]] # nclm x npair
 
-    def get_pure_HD(self):
-        """Calculate the Hellings and Downs correlation for each pulsar pair.
+    # check for potential vmap opportunities and jit-compile too while we're at it
+    if rho.ndim == 1:
+        normal_vmapper = lambda f : jit(f)
+        radio_vmapper = lambda f : jit(f)
+        pixel_vmapper = lambda f : jit(f)
+        sph_vmapper = lambda f : jit(f)
+        sqrt_vmapper = lambda f : jit(f)
+        harmonics_x0_vmapper = lambda f : f # this vmapper is used for constructing initial clms / blms given radiometer maps
+    elif rho.ndim == 2:
+        normal_vmapper = lambda f : vmap(jit(f)) # normal vmap; vmap over all arguments
+        radio_vmapper = lambda f : vmap(jit(f), (0,0,0,0,None)) # vmap over rho, N_inv, Lt, S, but not R
+        pixel_vmapper = lambda f : vmap(jit(f), (0,0,0,0,None,0,None,None)) # vmap over rho, S, Lt, and initial params but nothing else
+        sph_vmapper = lambda f : vmap(jit(f), (0,0,0,None,0,None,None)) # same as above
+        sqrt_vmapper = lambda f : vmap(jit(f), (0,0,0,None,0,None,None,None,None)) # same as above
+        harmonics_x0_vmapper = lambda f : vmap(f, (0,None)) # vmap over radiometer maps but not cached masks
+    elif rho.ndim == 3:
+        normal_vmapper = lambda f : vmap(vmap(jit(f)))
+        radio_vmapper = lambda f : vmap(vmap(jit(f), (0,0,0,0,None)), (0,0,0,0,None))
+        pixel_vmapper = lambda f : vmap(vmap(jit(f), (0,0,0,0,None,0,None,None)), (0,0,0,0,None,0,None,None))
+        sph_vmapper = lambda f : vmap(vmap(jit(f), (0,0,0,None,0,None,None)), (0,0,0,None,0,None,None))
+        sqrt_vmapper = lambda f : vmap(vmap(jit(f), (0,0,0,None,0,None,None,None,None)), (0,0,0,None,0,None,None,None,None))
+        harmonics_x0_vmapper = lambda f : vmap(vmap(f, (0,None)), (0,None))
+    else:
+        raise ValueError('rho has a number of dimensions outside of [1,3] but is assumed to have dimension 1, 2, or 3 in this function')
 
-        This function calculates the Hellings and Downs correlation for each pulsar
-        pair. This is done by using the values of xi potentially supplied upon 
-        construction. 
-
-        Returns:
-            np.ndarray: An array of HD correlation values for each pulsar pair.
-        """
-        #Return the theoretical HD curve given xi
-
-        xx = (1 - np.cos(self.xi)) / 2.
-        hd_curve = 1.5 * xx * np.log(xx) - xx / 4 + 0.5
-
-        return hd_curve
-
-    def anisotropy_recovery(self, basis, pair_cov):
-        """A method to do an anisotropy search given cross-correlations and relevant data.
-
-        Args:
-            basis (str): Which basis the decomposition is to be computed with. Must be 'pixel', 'radiometer', 'sqrt', or 'spherical'.
-            pair_cov (bool): A flag to use the pair covariance matrix if it was supplied
-
-        Raises:
-            ValueError: If pair_cov is True but no pair covariance matrix was supplied in initialization nor later with set_data().
-            NotImplementedError: If basis is 'eigenmaps'.
-            ValueError: If basis is not one of 'pixel', 'radiometer', 'sqrt', 'spherical', or 'eigenmaps'.
-
-        Returns:
-            tuple: If basis is 'radiometer', returns two arrays of len npix: the radiometer map and uncertainty.
-                Otherwise, if basis is 'pixel', returns as the first output an npix map of the power decomposition in the pixel basis,
-                and the second output contains information about the optimal step from JAXopt.
-                Otherwise, if basis is 'sqrt' or 'spherical', returns as the first output a float which is A2, next an nclm array of 
-                the power decomposition, and the third output contains information about the optimal step from JAXopt.
-        """
-        if pair_cov and self.pair_cov is None:
-            raise ValueError("No pair covariance matrix supplied! Set it with set_data()")
-        
-        if pair_cov: 
-            N_inv = self.pair_cov_N_inv
-            Lt = self._Lt_pc
-        else: 
-            N_inv = self.pair_ind_N_inv
-            Lt = self._Lt_nopc
-            
+    # Get basis decomposition
+    N_inv = normal_vmapper(jnp.linalg.inv)(C)
+    Lt = normal_vmapper(lambda N : jnp.linalg.cholesky(N).T)(N_inv)
+    
+    radiometer_output = radio_vmapper(radiometer_basis)(rho, N_inv, Lt, S, R)
+    if basis == 'radiometer':
+        basis_decomposition = radiometer_output
+    else:
+        radiometer_map = radiometer_output['pixel_map'] # use radiometer as initial params
         if basis == 'sqrt':
-            return _sqrt_basis(self.rho, self.Gamma_lm, Lt,
-                               self._bmvals_zero, self._blm_mask, self._blm_vals_float_power, self._bmvals_negative, self._beta_vals,
-                               self._clm_mask, self._mvals_float_power, self._mvals_positive, self._mvals_negative, self._SQRT2,
-                               jnp.array(np.random.uniform(-1,1,2*(self.blmax+1)**2 - 1)), self._b00)
+            blmax = l_max // 2
+            lvals = jnp.concatenate([jnp.repeat(jnp.arange(blmax+1), jnp.array([2*ll + 1 for ll in range(blmax+1)]))])
+            mvals = jnp.concatenate([jnp.arange(-ll, ll+1) for ll in range(blmax+1)])
+            radiometer2blm_cache = (blmax, lvals, mvals, gwtheta, gwphi)
+            params = harmonics_x0_vmapper(radiometer2blm_params)(radiometer_map, radiometer2blm_cache)
+            
+            alm2clm_cache = make_alm2clm_cache(l_max)
+            blm2alm_cache = make_blm2alm_cache(l_max)
+            basis_decomposition = sqrt_vmapper(sqrt_basis)(rho, S, Lt, Gamma_lm, params,
+                                                      alm2clm_cache, blm2alm_cache, maxiter, tol)
         elif basis == 'pixel':
-            return _pixel_basis(self.rho, self.F_mat, Lt, jnp.array(np.random.uniform(-1,1,self.npix)))
-        elif basis == 'radiometer':
-            return _radiometer_basis(self.rho, self.pix_area, N_inv, self.F_mat)
+            basis_decomposition = pixel_vmapper(pixel_basis)(rho, S, N_inv, Lt, R, radiometer_map, maxiter, tol)
         elif basis == 'spherical':
-            return _sph_basis(self.rho, self.Gamma_lm, Lt, jnp.array(np.random.uniform(-1,1,self.clm_size)), self._c00)
-        elif basis == 'eigenmaps':
-            raise NotImplementedError('Basis not implemented yet!')
+            lvals = jnp.concatenate([jnp.repeat(jnp.arange(l_max+1), jnp.array([2*ll + 1 for ll in range(l_max+1)]))])
+            mvals = jnp.concatenate([jnp.arange(-ll, ll+1) for ll in range(l_max+1)])
+            radiometer2clm_cache = (l_max, lvals, mvals, gwtheta, gwphi)
+            params = harmonics_x0_vmapper(radiometer2clm_params)(radiometer_map, radiometer2clm_cache)
+            basis_decomposition = sph_vmapper(sph_basis)(rho, S, Lt, Gamma_lm, params, maxiter, tol)
         else:
-            raise ValueError('Basis not recognized!')
+            raise ValueError("basis must be one of 'radiometer', 'sqrt', 'pixel', 'spherical'")
+            
+    # Get squared SNR
+    if basis in ('sqrt', 'spherical'):
+        clms = basis_decomposition['clm']
+        anis_orf = normal_vmapper(lambda clm : clm @ Gamma_lm)(clms)
+    else:
+        pixel_maps = basis_decomposition['pixel_map']
+        anis_orf = normal_vmapper(lambda pix : R @ pix)(pixel_maps)
+    A2 = basis_decomposition['A2']
+    anis_orf *= A2
+    HD = get_pure_HD(get_xi(psrs_theta, psrs_phi, pair_idx))
+    iso_orf = normal_vmapper(lambda S : S*HD)(S)
+    snr2 = normal_vmapper(orf2snr)(rho, iso_orf, anis_orf, N_inv)
+    
+    return basis_decomposition, snr2
 
-    def get_snrs_squared(self, basis_decomposition, basis, pair_cov):
-        """A method to calculate the square of the total, isotropic, and anisotropic SNRs given the recovered parameters of a search.
+def get_radec(psrs_theta, psrs_phi):
+    """
+    Get the pulsar positions in RA and DEC.
 
-        Args:
-            basis_decomposition (tuple, list, or np.ndarray): The recovered parameters of an anisotropy search.
-                This is an npix tuple, list, or array of pixel values if basis is 'pixel' or 'radiometer' or, if basis is 'sqrt' or 'spherical', this should
-                contain 1+nclm elements, where the first element is A2 and the rest are the clms.
-            basis (str): Which basis the decomposition was computed with. Must be 'pixel', 'radiometer', 'sqrt', or 'spherical'.
-            pair_cov (bool): A flag to use the pair covariance matrix if it was supplied
+    Args:
+        psrs_theta (jax.Array or np.ndarray): Pulsar theta coordinates in radians.
+        psrs_phi (jax.Array or np.ndarray): Pulsar phi coordinates in radians.
 
-        Raises:
-            ValueError: If pair_cov is True but no pair covariance matrix was supplied in initialization nor later with set_data().
-            ValueError: If basis is not one of 'pixel', 'radiometer', 'sqrt', or 'spherical'.
+    Returns:
+        tuple: A two-element tuple with the first being pulsar positions in right ascension and the second being declination.
+    """
+    psr_ra = psrs_phi
+    psr_dec = (jnp.pi/2) - psrs_theta
+    return psr_ra, psr_dec
 
-        Returns:
-            tuple: The square of the total, isotropic, and anisotropic SNRs.
-        """
-        if pair_cov and self.pair_cov is None:
-            raise ValueError("No pair covariance matrix supplied! Set it with set_data()")
+@jit
+def get_xi(psrs_theta, psrs_phi, pair_idx):
+    """Calculate the angular separation between pulsar pairs.
+
+    A function to compute the angular separation between pulsar pairs.
+
+    Args:
+        psrs_theta (jax.Array or np.ndarray): 1d array of theta values in radians of pulsar positions.
+        psrs_phi (jax.Array or np.ndarray): 1d array of phi values in radians of pulsar positions.
+        pair_idx (jax.Array or np.ndarray): 2d array of indices of pulsars for each pulsar pair.
+    Returns:
+        jax.Array: A 1d array of pair separations in radians.
+    """
+    psrs_ra, psrs_dec = get_radec(psrs_theta, psrs_phi)
+
+    x = jnp.cos(psrs_ra)*jnp.cos(psrs_dec)
+    y = jnp.sin(psrs_ra)*jnp.cos(psrs_dec)
+    z = jnp.sin(psrs_dec)
+
+    pos_vectors = jnp.array([x,y,z])
+
+    a,b = pair_idx[:,0], pair_idx[:,1]
+
+    xi = jnp.zeros( len(a) )
+    # This effectively does a dot product of pulsar position vectors for all pairs a,b
+    pos_dot = jnp.einsum('ij,ij->j', pos_vectors[:,a], pos_vectors[:, b])
+    xi = jnp.arccos( pos_dot )
+
+    return jnp.squeeze(xi)
+
+@jit
+def signalResponse_fast(ptheta_a, pphi_a, gwtheta_a, gwphi_a, pair_idx_a, pair_idx_b):
+    """
+    A function to get the PTA response matrix (npair by npix). Adapted from ENTERPRISE.
+
+    Args:
+        ptheta_a (jax.Array or np.ndarray): A 1d array containing the pulsar theta coordinates in radians.
+        pphi_a (jax.Array or np.ndarray): A 1d array containing the pulsar phi coordinates in radians.
+        gwtheta_a (jax.Array or np.ndarray): A 1d array containing the GW theta coordinates in radians.
+        gwphi_a (jax.Array or np.ndarray): A 1d array containing the GW phi coordinates in radians.
+        pair_idx_a (jax.Array or np.ndarray): A 1d array of length N_pair containing the indices of pulsar a.
+        pair_idx_b (jax.Array or np.ndarray): A 1d array of length N_pair containing the indices of pulsar b.
+
+    Returns:
+        tuple: A three-element tuple with the first element being the response matrix and the last two
+            being the responses to plus and cross polarized graviational waves, respectively.
+    """
+    gwphi, pphi = jnp.meshgrid(gwphi_a, pphi_a)
+    gwtheta, ptheta = jnp.meshgrid(gwtheta_a, ptheta_a)
+    p = jnp.array([jnp.cos(pphi) * jnp.sin(ptheta), jnp.sin(pphi) * jnp.sin(ptheta), jnp.cos(ptheta)])
+    Fp, Fc = createSignalResponse_pol(pphi, ptheta, gwphi, gwtheta, p)
+    R = Fp[pair_idx_a]*Fp[pair_idx_b] + Fc[pair_idx_a]*Fc[pair_idx_b]
+    return R, Fp, Fc
+    
+def createSignalResponse_pol(pphi, ptheta, gwphi, gwtheta, p):
+    """
+    A function to get the plus and cross polarized response matrices. Adapted from ENTERPRISE.
+
+    Args:
+        pphi (ArrayLike): ArrayLike containing the pulsar phi coordinates.
+        ptheta (ArrayLike): ArrayLike containing the pulsar theta coordinates.
+        gwphi (ArrayLike): ArrayLike containing the GW phi coordinates.
+        gwtheta (ArrayLike): ArrayLike containing the GW theta coordinates.
+        p (jax.Array or np.ndarray): Array containing the pulsar position unit vectors.
+
+    Returns:
+        tuple: A two-element tuple with the first element being the plus-polarized response and second being the cross-polarized
+            response.
+    """
+    Omega = jnp.array([-jnp.sin(gwtheta) * jnp.cos(gwphi), -jnp.sin(gwtheta) * jnp.sin(gwphi), -jnp.cos(gwtheta)])
+    mhat = jnp.array([-jnp.sin(gwphi), jnp.cos(gwphi), jnp.zeros(gwphi.shape)])
+    nhat = jnp.array([-jnp.cos(gwphi) * jnp.cos(gwtheta), -jnp.cos(gwtheta) * jnp.sin(gwphi), jnp.sin(gwtheta)])
+    npixels = Omega.shape[2]
+    c = jnp.sqrt(1.5) / jnp.sqrt(npixels)
+    Fp = 0.5 * c * (jnp.sum(nhat * p, axis=0) ** 2 - jnp.sum(mhat * p, axis=0) ** 2) / (1 - jnp.sum(Omega * p, axis=0))
+    Fc = c * jnp.sum(mhat * p, axis=0) * jnp.sum(nhat * p, axis=0) / (1 - jnp.sum(Omega * p, axis=0))
+    return Fp, Fc
+
+def spherical_response(Fp, Fc, gwtheta, gwphi, l_max):
+    """A function to compute the spherical harmonic basis antenna response matrix R_{clm, ab}.
+
+    This function computes the spherical harmonics basis antenna response 
+    matrix R_{clm, ab} where ab represents the pulsar pair made of pulsars 
+    a and b, and k represents the pixel index.
+    NOTE: This function uses the GW propogation direction for gwtheta and gwphi
+    rather than the source direction (i.e. this method uses the vector from the
+    source to the observer)
+
+    Returns:
+        jax.Array: An array of shape (nclm, npairs) containing the antenna
+            pattern response matrix.
+    """
+    FpFc = jnp.zeros((Fp.shape[0], 2*Fp.shape[1])).at[:,0::2].set(Fp).at[:,1::2].set(Fc)
+
+    lvals = jnp.concatenate([jnp.repeat(jnp.arange(l_max+1), jnp.array([2*ll + 1 for ll in range(l_max+1)]))])
+    mvals = jnp.concatenate([jnp.arange(-ll, ll+1) for ll in range(l_max+1)])
+    
+    ylm_maps = compute_ylm_maps(lvals, mvals, gwtheta, gwphi, l_max)
+
+    return _spherical_response(FpFc, ylm_maps)
+
+@jit
+def get_pure_HD(xi):
+    """Calculate the Hellings and Downs correlation for each pulsar pair.
+
+    This function calculates the Hellings and Downs correlation for each pulsar
+    pair.
+
+    Args:
+        xi (ArrayLike): A 1d ArrayLike containing the angular separations of the pulsars in each pair (in radians).
+
+    Returns:
+        jax.Array: An array of HD correlation values for each pulsar pair.
+    """
+    #Return the theoretical HD curve given xi
+
+    xx = (1 - jnp.cos(xi)) / 2.
+    hd_curve = 1.5 * xx * jnp.log(xx) - xx / 4 + 0.5
+
+    return hd_curve
+
+def make_alm2clm_cache(l_max):
+    """
+    A function to get square-root basis masks needed as inputs to alm2clm.
+
+    Args:
+        l_max (int): The l_max parameter of the search.
+
+    Returns:
+        list: The spherical harmonic basis masks for use in alm2clm.
+    """
+    alm2clm_cache = []
+    lvals = jnp.concatenate([jnp.repeat(jnp.arange(l_max+1), jnp.array([2*ll + 1 for ll in range(l_max+1)]))])
+    mvals = jnp.concatenate([jnp.arange(-ll, ll+1) for ll in range(l_max+1)])
+    abs_mvals = jnp.abs(mvals)
+    clm_mask = abs_mvals * (2 * l_max + 1 - abs_mvals) // 2 + lvals
+    mvals_positive = mvals > 0
+    mvals_negative = mvals < 0
+    mvals_float_power = jnp.float_power(-1, mvals)
+    for mask in (clm_mask, mvals_float_power, mvals_positive, mvals_negative):
+        alm2clm_cache.append(mask)
+    return alm2clm_cache
+    
+def make_blm2alm_cache(l_max):
+    """
+    A function to get square-root basis masks needed as inputs to blm2alm.
+
+    Args:
+        l_max (int): The l_max parameter of the search (not divided by 2 yet, i.e., not blmax).
+
+    Returns:
+        list: The square-root basis masks for use in blm2alm.
+    """
+    blm2alm_cache = []
+    blmax = l_max // 2
+    precomputed_CG_directory = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'precomputed_clebschGordan')
+    precomputed_CG_filename = os.path.join(precomputed_CG_directory, 'lmax'+str(l_max)+'.npz')
+    if os.path.exists(precomputed_CG_filename):
+        sqrt_basis_helper = np.load(precomputed_CG_filename)
+        beta_vals = sqrt_basis_helper['beta_vals']
+        blvals = sqrt_basis_helper['blvals']
+        bmvals = sqrt_basis_helper['bmvals']
+    else:
+        print('No precomputed CG coefficients found for this l_max. Computing them from scratch...')
+        from . import clebschGordan as CG
+        sqrt_basis_helper = CG.clebschGordan(l_max = l_max)
+        print('Done.')
+        beta_vals = jnp.array(sqrt_basis_helper.beta_vals)
+        blvals = jnp.array(sqrt_basis_helper.bl_idx)
+        bmvals = jnp.array(sqrt_basis_helper.bm_idx)
+
+        print('Saving computed CG coefficients to MAPS directory for next time.')
+        np.savez_compressed(precomputed_CG_filename, beta_vals=beta_vals, blvals=blvals, bmvals=bmvals)
+        print('Done saving.')
         
-        if basis in ['pixel', 'radiometer']:
-            model_orf = _map2orf(basis_decomposition, self.F_mat)
-        elif basis in ['sqrt', 'spherical']:
-            model_orf = basis_decomposition[0]*_clm2orf(basis_decomposition[1:], self.Gamma_lm)
-        else:
-            raise ValueError('Basis not recognized!')
-        
-        if pair_cov: 
-            Lt = self._Lt_pc
-        else:
-            Lt = self._Lt_nopc
-        
-        iso_orf, state = _iso_fit(self.rho, Lt, self._HD, 2*jnp.array(np.random.uniform(-1,1)))
-        
-        if pair_cov:
-            if self._snr_norm is None:
-                self._snr_norm = _get_snr_norm(self.sig, self.pair_cov)
-            return _orf2snr(model_orf, iso_orf, self.rho, self.pair_cov_N_inv, self.pair_ind_N_inv, self._snr_norm)
-        else:
-            return _orf2snr_nopc(model_orf, iso_orf, self.rho, self.pair_ind_N_inv)
+    abs_bmvals = jnp.abs(bmvals)
 
-    def _make_cache(self):
-        # An internal method to cache some values and masks.
-        self._SQRT2 = jnp.sqrt(2)
-        self._HD = jnp.array(self.get_pure_HD())
-        self._c00 = jnp.array([jnp.sqrt(4*jnp.pi)])
-        self._b00 = jnp.array([1])
-        self.pix_area = hp.nside2pixarea(self.nside)
-        # Sqrt basis cache
-        self._beta_vals = jnp.array(self.sqrt_basis_helper.beta_vals)
-        self._blvals = jnp.array(self.sqrt_basis_helper.bl_idx)
-        self._bmvals = jnp.array(self.sqrt_basis_helper.bm_idx)
-        self._abs_bmvals = jnp.abs(self._bmvals)
-        self._lvals = jnp.concatenate([jnp.repeat(jnp.arange(0, self.l_max+1), jnp.array([2*ll + 1 for ll in range(0, self.l_max+1)]))])
-        self._mvals = jnp.concatenate([jnp.arange(-ll, ll+1) for ll in range(0, self.l_max+1)])
-        self._abs_mvals = jnp.abs(self._mvals)
-        self._clm_mask = self._abs_mvals * (2 * self.l_max + 1 - self._abs_mvals) // 2 + self._lvals
-        self._mvals_positive = self._mvals > 0
-        self._mvals_negative = self._mvals < 0
-        self._mvals_float_power = jnp.float_power(-1, self._mvals)
-        self._blm_mask = self._abs_bmvals * (2*self.blmax+1 - self._abs_bmvals) // 2 + self._blvals
-        self._blm_vals_float_power = jnp.float_power(-1, self._bmvals)
-        self._bmvals_negative = self._bmvals < 0
-        self._bmvals_zero = self._bmvals == 0
+    blm_mask = abs_bmvals * (2*blmax+1 - abs_bmvals) // 2 + blvals
+    blm_vals_float_power = jnp.float_power(-1, bmvals)
+    bmvals_negative = bmvals < 0
+    bmvals_zero = bmvals[bmvals >= 0] == 0
+    for mask in (blm_mask, blm_vals_float_power, bmvals_negative, beta_vals, bmvals_zero):
+        blm2alm_cache.append(mask)
+    return blm2alm_cache
 
-# JAX functions - anisotropy bases at the top and utils at the bottom
+def alm2clm(alm, alm2clm_cache):
+    """
+    A function to compute clm given alm. Adapted from ENTERPRISE.
 
-# Anisotropy bases
+    Args:
+        alm (ArrayLike): A 1d array of alm values to be converted into clm values.
+        sph_cache (list): A list of masks used during the conversion. Get this from make_sph_cache.
 
-@jax.jit
-def _radiometer_basis(rho, pix_area, N_inv, F_mat):
-    fisher_matrix_radiometer = jnp.diag( F_mat.T @ N_inv @ F_mat )
-    dirty_map = F_mat.T @ N_inv @ rho
-    fisher_diag_inv = jnp.diag( 1/fisher_matrix_radiometer )
-    radio_map = fisher_diag_inv @ dirty_map
-    norm = 4 * jnp.pi / trapezoid(radio_map, dx = pix_area)
-    radio_map_n = radio_map * norm
-    radio_map_err = jnp.sqrt(jnp.diag(fisher_diag_inv)) * norm
-    return radio_map_n, radio_map_err
-
-@jax.jit
-def _pixel_basis(rho, F_mat, Lt, params):
-    def residuals(params):
-        pixel_map = 10**params
-        model_orf = F_mat @ pixel_map
-        r = rho - model_orf
-        return Lt @ r
-    opt_params, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run(params)
-    opt_pixel_map = 10**opt_params
-    return opt_pixel_map, state
-
-@jax.jit
-def _sph_basis(rho, Gamma_lm, Lt, params, c00):
-    def residuals(params):
-        A2 = 10**(params[0]) # Model the amplitude in log-space.
-        clm = jnp.concatenate( (c00,params[1:]) )
-        orf = clm @ Gamma_lm
-        model_orf = A2*orf
-        r = rho - model_orf
-        return Lt @ r
-    opt_params, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run(params)
-    opt_A2 = 10**(opt_params[0])
-    opt_clm = jnp.concatenate( (c00,opt_params[1:]) )
-    return opt_A2, opt_clm, state
-
-# almost unreadable from how much caching I'm using
-# it may help to see the equivalent function in anis_pta.py if wanting to understand the cached masks
-@jax.jit
-def _sqrt_basis(rho, Gamma_lm, Lt,
-                cache_bmvals_zero, cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative, cache_beta_vals,
-                cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2,
-                params, b00):
-    def residuals(params):
-        A2 = 10**(2*jnp.sin(params[0])) # Model the amplitude in log-space. Use 2*sine to bound the parameter within 2 orders of magnitude.
-        blm = jnp.concatenate( (b00, params[1::2]+1j*params[2::2]) ) # After A2, the parameters alternate between real and imaginary components.
-        real_blm = jnp.real(blm)
-        blm = jnp.where(cache_bmvals_zero, real_blm, blm) # bl0 is real rather than complex.
-        alm = _blm2alm(blm, 
-                       cache_beta_vals, cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative)
-        clm = _alm2clm(alm,
-                       cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2)
-        orf = clm @ Gamma_lm
-        model_orf = A2*orf
-        r = rho - model_orf
-        return Lt @ r
-    opt_params, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run(params)
-    opt_A2 = 10**(2*jnp.sin(opt_params[0]))
-    opt_blm = jnp.concatenate( (b00, opt_params[1::2]+1j*opt_params[2::2]) )
-    real_opt_blm = jnp.real(opt_blm)
-    opt_blm = jnp.where(cache_bmvals_zero, real_opt_blm, opt_blm)
-    opt_alm = _blm2alm(opt_blm, cache_beta_vals,
-                       cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative)
-    opt_clm = _alm2clm(opt_alm,
-                       cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2)
-    return opt_A2, opt_clm, state
-
-@jax.jit
-def _iso_fit(rho, Lt, HD_curve, logA2):
-    # Fit HD to rho by varying a single parameter logA2. 
-    # Used in the null-hypothesis of the anisotropic SNR.
-    def residuals(logA2):
-        model_orf = 10**logA2 * HD_curve
-        r = rho - model_orf
-        return Lt @ r
-    opt_logA2, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True).run(logA2)
-    return 10**opt_logA2 * HD_curve, state
-
-@jax.jit
-def _map2orf(pixel_map, F_mat):
-        return F_mat @ pixel_map
-
-@jax.jit
-def _clm2orf(clm, Gamma_lm):
-        return clm @ Gamma_lm
-
-@jax.jit
-def _orf2snr_nopc(ani_orf, iso_orf, rho, pair_ind_N_inv):
-    # Log-likelihood ratio between the various models.
-    ani_res = rho - ani_orf
-    iso_res = rho - iso_orf
-    snm = (-1/2)*((ani_res).T @ pair_ind_N_inv @ (ani_res)) # Anisotropy chi-square
-    hdnm = (-1/2)*((iso_res).T @ pair_ind_N_inv @ (iso_res)) # Isotropy chi-square
-    nm = (-1/2)*((rho).T @ pair_ind_N_inv @ (rho)) # Null chi-square (Not pair covariant)
-    total_sn2 = 2 * (snm - nm)
-    iso_sn2 = 2 * (hdnm - nm)
-    anis_sn2 = 2 * (snm - hdnm)
-    return total_sn2, iso_sn2, anis_sn2
-
-@jax.jit
-def _get_snr_norm(sig, pair_cov_matrix):
-    det_sig = jnp.linalg.slogdet(jnp.diag(sig))[1]
-    det_paircov = jnp.linalg.slogdet(pair_cov_matrix)[1]
-    return 0.5*(det_sig - det_paircov)
-
-@jax.jit
-def _orf2snr(ani_orf, iso_orf, rho, pair_cov_N_inv, pair_ind_N_inv, snr_norm):
-    # Log-likelihood ratio between the various models. 
-    # snr_norm accounts for the square-root of the determinants of Sigma and C.
-    ani_res = rho - ani_orf
-    iso_res = rho - iso_orf
-    snm = (-1/2)*((ani_res).T @ pair_cov_N_inv @ (ani_res)) # Anisotropy chi-square
-    hdnm = (-1/2)*((iso_res).T @ pair_cov_N_inv @ (iso_res)) # Isotropy chi-square
-    nm = (-1/2)*((rho).T @ pair_ind_N_inv @ (rho)) # Null chi-square (Not pair covariant)
-    total_sn2 = 2 * (snm - nm + snr_norm)
-    iso_sn2 = 2 * (hdnm - nm + snr_norm)
-    anis_sn2 = 2 * (snm - hdnm)
-    return total_sn2, iso_sn2, anis_sn2
-
-# utils functions
-@jax.jit
-def _alm2clm(alm,
-             cache_clm_mask, cache_m_vals_float_power, cache_m_vals_positive, cache_m_vals_negative, SQRT2):
-    clm = alm[cache_clm_mask]
-    cache_positive_m = cache_m_vals_float_power * jnp.real(clm) * SQRT2
-    cache_negative_m = cache_m_vals_float_power * jnp.imag(clm) * SQRT2
-    clm = jnp.where(cache_m_vals_positive, cache_positive_m, clm)
-    clm = jnp.where(cache_m_vals_negative, cache_negative_m, clm)
+    Returns:
+        ArrayLike: A 1d array of clm values.
+    """
+    clm = alm[alm2clm_cache[0]]
+    clms_with_positive_m = alm2clm_cache[1] * jnp.real(clm) * jnp.sqrt(2)
+    clms_with_negative_m = alm2clm_cache[1] * jnp.imag(clm) * jnp.sqrt(2)
+    clm = jnp.where(alm2clm_cache[2], clms_with_positive_m, clm)
+    clm = jnp.where(alm2clm_cache[3], clms_with_negative_m, clm)
     clm = jnp.real(clm)
     return clm
 
-@jax.jit
-def _blm2alm(blms_in, beta_vals, 
-             cache_blm_mask, cache_blm_vals_float_power, cache_bmvals_negative):
-    blm_full = blms_in[cache_blm_mask]
-    cache_blm_full = cache_blm_vals_float_power*jnp.conj(blm_full)
-    blm_full = jnp.where(cache_bmvals_negative, cache_blm_full, blm_full)
-    alm_vals = jnp.einsum('ijk,j,k', beta_vals, blm_full, blm_full)
+def blm2alm(blms, blm2alm_cache):
+    """
+    A function to compute a set of alms given blms.
+
+    Args:
+        blms (ArrayLike): A 1d array of blm values to be converted into alm values.
+        sqrt_cache (list): A list of masks used during the conversion. Get this from make_sqrt_cache.
+
+    Returns:
+        ArrayLike: A 1d array of alm values.
+    """
+    blm_full = blms[blm2alm_cache[0]]
+    blms_with_negative_m = blm2alm_cache[1]*jnp.conj(blm_full)
+    blm_full = jnp.where(blm2alm_cache[2], blms_with_negative_m, blm_full)
+    alm_vals = jnp.einsum('ijk,j,k', blm2alm_cache[3], blm_full, blm_full)
     return alm_vals
 
-@jax.jit
-def _get_N_inv_nopc(sig):
-    return jnp.diag(1/sig ** 2)
+def radiometer_basis(rho, N_inv, Lt, S, R):
+    """
+    A function to get the radiometer basis decomposition.
 
-@jax.jit
-def _get_N_inv(sig, C):
-    A = jnp.diag(sig ** 2)
-    K = C - A
-    In = jnp.eye(A.shape[0])
-    return _woodbury_inverse(A, In, In, K)
+    Args:
+        rho (jax.Array or np.ndarray): A 1d array of cross-correlations.
+        N_inv (jax.Array or np.ndarray): A 2d array of the inverted covariance matrix.
+        R (jax.Array or np.ndarray): The PTA response matrix (npix x npair).
 
-@jax.jit
-def _woodbury_inverse(A, U, C, V): 
-    # basically from stack overflow 
-    # assumes C is the identity
-    # has benefit of vector multiplication instead of diagonal matrix multiplication
-    A_inv_diag = 1/jnp.diag(A) 
-    B_inv = jnp.linalg.inv(C + (V * A_inv_diag) @ U)
-    return jnp.diag(A_inv_diag) - (A_inv_diag.reshape(-1,1) * U @ B_inv @ V * A_inv_diag)
+    Returns:
+        dict: A dictionary with keys 'basis' labeling what basis was used (radiometer), 'pixel_map' with
+            the normalized, recovered radiometer decomposition, and 'pixel_map_err' with the normalized
+            uncertainties on the decomposition
+    """
+    fisher_matrix_radiometer = jnp.diag( R.T @ N_inv @ R )
+    dirty_map = R.T @ N_inv @ rho
+    fisher_diag_inv = jnp.diag( 1/fisher_matrix_radiometer )
+    radio_map = fisher_diag_inv @ dirty_map
+    norm = radio_map.shape[0] / jnp.sum(radio_map)
+    radio_map_n = radio_map * norm
+    radio_map_err = jnp.sqrt(jnp.diag(fisher_diag_inv)) * norm
 
-@jax.jit
-def _get_Lt(N_inv):
-    return jnp.linalg.cholesky(N_inv).T
+    model_orf = R @ radio_map_n
+    A2 = (model_orf.T @ N_inv @ rho) / (model_orf.T @ N_inv @ model_orf)
+    
+    out = {}
+    out['A2'] = A2
+    out['pixel_map'] = radio_map_n
+    out['pixel_map_err'] = radio_map_err
+    return out
 
-@jax.jit
-def _get_Lt_nopc(sig):
-    return jnp.diag(1/sig)
+def pixel_basis(rho, S, N_inv, Lt, R, radiometer_map, maxiter=500, tol=1e-5):
+    """
+    A function to get the pixel basis decomposition.
 
-@jax.jit
-def _get_fisher_radiometer(F_mat, N_inv):
-    return jnp.diag( F_mat.T @ N_inv @ F_mat )
+    Args:
+        rho (jax.Array or np.ndarray): A 1d array of cross-correlations.
+        S (jax.Array or np.ndarray): A 1d array with one element, which is the optimal statistic amplitude.
+        Lt (jax.Array or np.ndarray): A 2d array corresponding to the cholesky decomposition of the inverted
+            covariance matrix.
+        R (jax.Array or np.ndarray): The PTA response matrix (npix x npair).
+        maxiter (int): The maximum number of steps to run the solve for. Defaults to 30.
+        tol (float): The absolute tolerance to stop the solver early. Defaults to 1e-5.
+        materialize_jac (bool): Whether to materialize the Jacobian in the Levenberg-Marquardt algorithm.
+            Defaults to True.
+
+    Returns:
+        dict: A dictionary with keys 'basis' labeling what basis was used (pixel), 'pixel_map' with the
+            normalized, recovered pixel decomposition, 'A2' with the amplitude of the ORF (or, equivalently,
+            pixel map), and 'state' with the state of the final step of the JAXopt solve.
+    """
+    params = jnp.where(radiometer_map < 0, jnp.min(jnp.abs(radiometer_map)), radiometer_map)
+    params = jnp.concatenate((jnp.zeros(1), jnp.log10(params)))
+    def residuals(params):
+        pixel_map = 10**params[1:]
+        model_orf = R @ pixel_map
+        A2 = 10**(2*jnp.sin(params[0])+jnp.log10(S))
+        r = rho - A2*model_orf
+        return r.T @ N_inv @ r
+    opt_params, state = jaxopt.LBFGS(residuals, jit=True, maxiter=maxiter, tol=tol).run(params)
+    opt_pixel_map = 10**opt_params[1:]
+    opt_model_orf = R @ opt_pixel_map
+    opt_A2 = 10**(2*jnp.sin(opt_params[0])+jnp.log10(S))
+    
+    out = {}
+    out['state'] = state
+    out['A2'] = opt_A2
+    out['pixel_map'] = opt_pixel_map
+    return out
+
+def sph_basis(rho, S, Lt, Gamma_lm, params, maxiter=30, tol=1e-5):
+    """
+    A function to get the spherical harmonic basis decomposition.
+
+    Args:
+        rho (jax.Array or np.ndarray): A 1d array of cross-correlations.
+        S (jax.Array or np.ndarray): A 1d array with one element, which is the optimal statistic amplitude.
+        Lt (jax.Array or np.ndarray): A 2d array corresponding to the cholesky decomposition of the inverted
+            covariance matrix.
+        Gamma_lm (jax.Array or np.ndarray): The PTA response matrix (nclm x npair).
+        maxiter (int): The maximum number of steps to run the solve for. Defaults to 30.
+        tol (float): The absolute tolerance to stop the solver early. Defaults to 1e-5.
+
+    Returns:
+        dict: A dictionary with keys 'basis' labeling what basis was used (spherical), 'clm' with the
+            normalized, recovered clms, 'A2' with the amplitude of the ORF, and 'state' with the state 
+            of the final step of the JAXopt solve.
+    """
+    c00 = jnp.array([jnp.sqrt(4*jnp.pi)])
+    def residuals(params):
+        A2 = 10**(2*jnp.sin(params[0]) + jnp.log10(S))
+        clm = jnp.concatenate( (c00,params[1:]) )
+        orf = clm @ Gamma_lm
+        r = rho - A2*orf
+        return Lt @ r
+    opt_params, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True, maxiter=maxiter, tol=tol).run(params)
+    opt_A2 = 10**(2*jnp.sin(opt_params[0]) + jnp.log10(S))
+    opt_clm = jnp.concatenate( (c00,opt_params[1:]) )
+    
+    out = {}
+    out['state'] = state
+    out['A2'] = opt_A2
+    out['clm'] = opt_clm
+    return out
+
+def sqrt_basis(rho, S, Lt, Gamma_lm, params, alm2clm_cache, blm2alm_cache, maxiter=30, tol=1e-5):
+    """
+    A function to get the square-root spherical harmonic basis decomposition.
+
+    Args:
+        rho (jax.Array or np.ndarray): A 1d array of cross-correlations.
+        S (jax.Array or np.ndarray): A 1d array with one element, which is the optimal statistic amplitude.
+        Lt (jax.Array or np.ndarray): A 2d array corresponding to the cholesky decomposition of the inverted
+            covariance matrix.
+        Gamma_lm (jax.Array or np.ndarray): The PTA response matrix (nclm x npair).
+        alm2clm_cache (list): Masks for use in alm2clm. Get this list from make_alm2clm_cache.
+        blm2alm_cache (list): Masks for use in blm2alm. Get this list from make_blm2alm_cache.
+        maxiter (int): The maximum number of steps to run the solve for. Defaults to 30.
+        tol (float): The absolute tolerance to stop the solver early. Defaults to 1e-5.
+
+    Returns:
+        dict: A dictionary with keys 'basis' labeling what basis was used (sqrt), 'clm' with the
+            normalized, recovered clms, 'A2' with the amplitude of the ORF, and 'state' with the state 
+            of the final step of the JAXopt solve.
+    """
+    b00 = jnp.ones(1)
+    def residuals(params):
+        A2 = 10**(2*jnp.sin(params[0])+jnp.log10(S))
+        blm = jnp.concatenate( (b00, params[1::2]+1j*params[2::2]) ) # After A2, the parameters alternate between real and imaginary components.
+        blm = jnp.where(blm2alm_cache[4], jnp.real(blm), blm) # bl0 is real rather than complex.
+        alm = blm2alm(blm, blm2alm_cache)
+        clm = alm2clm(alm, alm2clm_cache)
+        orf = clm @ Gamma_lm
+        r = rho - A2*orf
+        return Lt @ r
+    opt_params, state = jaxopt.LevenbergMarquardt(residuals, materialize_jac=True, jit=True, maxiter=maxiter, tol=tol).run(params)
+    opt_A2 = 10**(2*jnp.sin(opt_params[0])+jnp.log10(S))
+    opt_blm = jnp.concatenate( (b00, opt_params[1::2]+1j*opt_params[2::2]) )
+    opt_blm = jnp.where(blm2alm_cache[4], jnp.real(opt_blm), opt_blm)
+    opt_alm = blm2alm(opt_blm, blm2alm_cache)
+    opt_clm = alm2clm(opt_alm, alm2clm_cache)
+    
+    out = {}
+    out['state'] = state
+    out['A2'] = opt_A2
+    out['clm'] = opt_clm
+    return out
+
+def orf2snr(rho, iso_orf, anis_orf, N_inv):
+    """
+    A function to get the squared anisotropic SNR.
+
+    Args:
+        iso_orf (jax.Array or np.ndarray): A 1d array of cross-correlations given by amplitude times the HD correlations.
+            Used in the null hypothesis.
+        anis_orf (jax.Array or np.ndarray): A 1d array of a best-fit anisotropic ORF scaled by amplitude.
+        N_inv (jax.Array or np.ndarray): A 2d array corresponding to the inverted covariance matrix.
+        
+    Returns:
+        float: The squared anisotropic SNR.
+    """
+    anis_res = rho - anis_orf
+    iso_res = rho - iso_orf
+    snm = -(anis_res.T @ N_inv @ anis_res)
+    hdnm = -(iso_res.T @ N_inv @ iso_res)
+    anis_sn2 = snm - hdnm
+    return anis_sn2
+
+@partial(jit, static_argnums=(4,))
+def compute_ylm_maps(n, m, theta, phi, lmax):
+    """
+    A function to compute the real spherical harmonics on a HEALPix grid. Computes Y_nm(theta, phi) for each pair (n,m)
+    in zip(n,m) and each pair (theta,phi) in zip(theta,phi). Adapted from ENTERPRISE.
+
+    Args:
+        n (jax.Array or np.ndarray): An array of l values of the real spherical harmonics to be computed.
+        m (jax.Array or np.ndarray): An array of m values of the real spherical harmonics to be computed.
+        theta (jax.Array or np.ndarray): The theta values at which to evalute the real spherical harmonics.
+        phi (jax.Array or np.ndarray): The phi values at which to evaluate the real spherial harmonics.
+        lmax (int): Set this equal to or larger than the largest value in n. Just an argument to pass to JAX.
+
+    Returns:
+        jax.Array: The real spherical harmonics evaluated at every pair in zip(theta, phi).
+            Has size len(n) by len(theta).
+    """
+    # _compute_ylm_maps() is used in constructing the spherical harmonic basis
+    def evaluate_ylm_at_point(n, m, theta, phi, lmax):
+        # evaluate_ylm_at_point() is a wrapper to allow integer n,m to be passed instead of arrays so that vmap will work smoothly
+        return sph_harm_y(jnp.array([n]), jnp.array([m]), theta, phi, n_max=lmax)[0]
+
+    evaluate_ylm_on_map = vmap(evaluate_ylm_at_point, in_axes=(None,None,0,0,None)) # vmap over theta and phi
+    complex_output = vmap(evaluate_ylm_on_map, in_axes=(0,0,None,None,None))(n, m, theta, phi, lmax) # vmap over l and m
+    output = jnp.where((m[:,None] > 0),
+                    (complex_output + jnp.conj(complex_output)) / jnp.sqrt(2),
+                     complex_output)
+    output = jnp.where((m[:,None] < 0),
+                 jnp.float_power(-1., m[:,None])*(jnp.conj(complex_output) - complex_output) / (1j*jnp.sqrt(2)),
+                     output)
+    return jnp.real(output)
+
+@jit
+def _spherical_response(FpFc, ylm_maps):
+    """
+    A function to compute the PTA response matrix in the spherical harmonic basis. Adapted from ENTERPRISE.
+
+    Args:
+        FpFc (jax.Array or np.ndarray): The PTA response matrices interweaved by polarization into a single matrix which has
+            size npair by 2*npix.
+        ylm_maps (jax.Array or np.ndarray): The spherical harmonics evaluated on a HEALPix grid. Get this from _compute_ylm_maps.
+            Should be size nclm by npix.
+    Returns:
+        jax.Array: The response matrix of size nclm by npair.
+    """
+    ylm_maps_both_polarizations = jnp.repeat(ylm_maps, 2).reshape(ylm_maps.shape[0], -1)
+
+    hdcov_F = jnp.dot(FpFc * ylm_maps_both_polarizations[:,None], FpFc.T)
+
+    def add_pulsar_term(cov):
+        return cov + jnp.diag(jnp.diag(cov))
+
+    basis = vmap(add_pulsar_term)(hdcov_F)
+    return basis
+
+def radiometer2clm_params(radiometer_map, radiometer2clm_cache):
+    """
+    A function to get clms corresponding to a radiometer (or any pixel) map using orthonormality of the spherical harmonics.
+
+    Notes:
+        Only approximates the shape of the map and does not accurately transform amplitude.
+
+    Args:
+        radiometer_map (jax.Array or np.ndarray):
+        radiometer2clm_cache (tuple): Just some useful arrays for the manipulation. Look in the code for correlations2anisotropy 
+            to see what goes into this, but this function is not really intended to be used by most users anyway as the main
+            API is through correlations2anisotropy.
+            
+    Returns:
+        jax.Array: The clm coefficients.
+    """
+    l_max = radiometer2clm_cache[0]
+    lvals = radiometer2clm_cache[1]
+    mvals = radiometer2clm_cache[2]
+    gwtheta, gwphi = radiometer2clm_cache[3], radiometer2clm_cache[4]
+
+    clms = jnp.dot(compute_ylm_maps(lvals, mvals, gwtheta, gwphi, l_max), radiometer_map) * 4*jnp.pi/radiometer_map.shape[0]
+    clms *= jnp.sqrt(4*jnp.pi)/clms[0] # normalize
+    return jnp.concatenate( (jnp.array([0]), clms[1:]) ) # concatenate logA2 and remove c00
+
+def radiometer2blm_params(radiometer_map, radiometer2blm_cache):
+    """
+    A function to get blm parameters corresponding to a radiometer (or any pixel) map.
+
+    Notes:
+        The strategy is to take the square root of the map, decompose it into clms, turn the clms into blms, 
+        and finally turn the blms into blm parameters.
+        Only approximates the shape of the map and does not accurately transform amplitude.
+
+    Args:
+        radiometer_map (jax.Array or np.ndarray): The map to be turned into blm parameters.
+        radiometer2blm_cache (tuple): Just some useful arrays for the manipulation. Look in the code for correlations2anisotropy 
+            to see what goes into this, but this function is not really intended to be used by most users anyway as the main
+            API is through correlations2anisotropy.
+
+    Returns:
+        jax.Array: The blm parameters.
+    """
+    blmax = radiometer2blm_cache[0]
+    lvals = radiometer2blm_cache[1]
+    mvals = radiometer2blm_cache[2]
+    gwtheta, gwphi = radiometer2blm_cache[3], radiometer2blm_cache[4]
+
+    sqrt_map = jnp.sqrt(jnp.where(radiometer_map < 0, 0, radiometer_map)) # square root of amplitude after setting negatives to zero
+    clms = jnp.dot(compute_ylm_maps(lvals,mvals,gwtheta,gwphi,blmax), sqrt_map) * 4*jnp.pi/768 # orthonormality condition of spherical harmonics
+
+    # clms -> blms (complex and no negative m's) (Note that blms here are basically alms but at blmax rather than l_max)
+    blms = jnp.ones( (blmax+1) + ((blmax+1)**2 - (blmax+1))//2, dtype=complex) # shape is n_(m=0) + n_(m>0) = blmax+1 + n_(m>0) = ...
+    clm_0_index = np.argwhere(mvals == 0).flatten()
+    l = jnp.concatenate([jnp.repeat(jnp.arange(blmax+1), jnp.array([ll + 1 for ll in range(blmax+1)]))])
+    m = jnp.concatenate([jnp.arange(ll+1) for ll in range(blmax+1)])
+    idx = m * (2 * blmax + 1 - m) // 2 + l
+    blm = jnp.where( m == 0, clms[clm_0_index[l]],
+                    (clms[clm_0_index[l] + m] + (-1)**m*1j*clms[clm_0_index[l] - m]) / jnp.sqrt(2) )
+    blms = blms.at[idx].set(blm)
+
+    # blms -> blm_params (split each blm into a real parameter and imaginary parameter)
+    blm_params = jnp.empty((2*blms.size-2))
+    blm_params = blm_params.at[0::2].set(blms[1:].real)
+    blm_params = blm_params.at[1::2].set(blms[1:].imag) # the m = 0 imaginary components will be discarded in the residuals function
+    
+    blm_params = jnp.concatenate((jnp.array([0]), blm_params)) # add logA2
+    
+    return blm_params
